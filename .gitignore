@@ -40,7 +40,7 @@ env/
 .ipynb_checkpoints
 
 # Output files
-outputs/
+# outputs/
 *.png
 *.jpg
 *.pdf
