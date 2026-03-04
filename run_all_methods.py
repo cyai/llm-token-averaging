@@ -358,8 +358,13 @@ def create_comparison_report(
                 .round(4)
                 .reset_index()
             )
-            fh.write(summary.to_markdown(index=False))
-            fh.write("\n\n")
+            # Write Markdown table without requiring the tabulate package
+            cols = list(summary.columns)
+            fh.write("| " + " | ".join(cols) + " |\n")
+            fh.write("| " + " | ".join(["---"] * len(cols)) + " |\n")
+            for _, row in summary.iterrows():
+                fh.write("| " + " | ".join(str(row[c]) for c in cols) + " |\n")
+            fh.write("\n")
 
         fh.write("## Per-method output directories\n\n")
         for method in all_method_rows:
