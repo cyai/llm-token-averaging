@@ -39,14 +39,14 @@ env/
 # Jupyter Notebooks
 .ipynb_checkpoints
 
-# Output files
-# outputs/
-*.png
-*.jpg
-*.pdf
-*.csv
-*.json
+# Output files — track everything under outputs/ except raw logs
+outputs/logs/
 *.log
+
+# Don't track model / dataset caches globally
+*.bin
+*.pt
+*.safetensors
 
 # Model cache
 .cache/
