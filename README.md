@@ -370,6 +370,12 @@ python experiments/zero_shot/run_zero_shot.py --all_configs --device cuda
 python experiments/from_scratch/run_from_scratch.py --all_configs --device cuda
 python experiments/finetune/run_finetune.py --all_configs --device cuda
 python experiments/compare/run_compare.py
+
+# nohup background run
+nohup python experiments/zero_shot/run_zero_shot.py --all_configs --device cuda > outputs/zero_shot.log 2>&1 &
+nohup python experiments/from_scratch/run_from_scratch.py --all_configs --device cuda > outputs/from_scratch.log 2>&1 &
+nohup python experiments/finetune/run_finetune.py --all_configs --device cuda > outputs/finetune.log 2>&1 &
+nohup python experiments/compare/run_compare.py > outputs/compare.log 2>&1 &
 ```
 
 ---

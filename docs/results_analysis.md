@@ -15,6 +15,7 @@ We test five compression strategies — uniform averaging, dynamic group sizes, 
 
 ## Table of Contents
 
+- [Glossary](#glossary)
 1. [Introduction](#1-introduction)
 2. [Experimental Setup](#2-experimental-setup)
 3. [How to Read the Metrics](#3-how-to-read-the-metrics)
@@ -49,6 +50,148 @@ We test five compression strategies — uniform averaging, dynamic group sizes, 
 10. [Key Findings](#10-key-findings)
 11. [Conclusions and Implications](#11-conclusions-and-implications)
 12. [Limitations and Future Work](#12-limitations-and-future-work)
+
+---
+
+## Glossary
+
+A plain-language reference for every term used throughout this document. Intended for readers who are not deeply familiar with NLP or ML — everything here is explained from first principles.
+
+---
+
+### Core Concepts
+
+**Token**
+The basic unit of text that a language model reads. A tokeniser splits raw text into tokens — roughly one token per word, though common words are a single token and rare or compound words may be split across several. For example, `"running"` is one token; `"unambiguously"` might be three. Pythia-410m uses the GPT-NeoX tokeniser with a vocabulary of ~50,257 tokens.
+
+**Token embedding**
+Before any transformer computation happens, each token ID is looked up in an embedding table to produce a dense floating-point vector (for Pythia-410m, a 1,024-dimensional vector). This vector encodes the identity and meaning of the token in a high-dimensional continuous space. All five analysis methods operate directly on these embedding vectors.
+
+**Context window / context length**
+The maximum number of tokens a model can attend to in one forward pass. If the window is 512 tokens, the model cannot see anything earlier than the 512 most recent tokens. This project investigates whether averaging adjacent token embeddings can effectively extend this window without changing the architecture.
+
+**Token averaging**
+The central operation of this project: replace every group of k consecutive token embeddings with their (possibly weighted) average, producing a shorter sequence. k tokens in → 1 token out. A sequence of T tokens becomes T/k tokens, and the transformer processes T/k positions instead of T — effectively reading k× more text per forward pass.
+
+---
+
+### The k Parameter
+
+**k (window size)**
+The number of consecutive token embeddings averaged into a single vector. The most important parameter in all experiments.
+
+| k | Meaning | Context multiplier |
+|---|---|---|
+| 1 | No averaging — baseline | 1× |
+| 2 | Pairs of tokens averaged | 2× |
+| 4 | Quads of tokens averaged | 4× |
+| 8 | Octets of tokens averaged | 8× |
+| 16 | 16-token windows averaged | 16× |
+| 128 | 128-token windows averaged | 128× |
+
+In the embedding analysis (Phase 1), k values up to 128 are tested. In the LLM experiments (Phase 2), k = 1, 2, 4, 8 are the main values.
+
+**Compression ratio**
+The fraction of the original token sequence removed by averaging. Defined as `1 - 1/k`.
+
+| k | Compression ratio |
+|---|---|
+| 1 | 0% — no compression |
+| 2 | 50% |
+| 4 | 75% |
+| 8 | 87.5% |
+| 16 | 93.75% |
+
+Higher compression = more context extension = more information potentially lost.
+
+---
+
+### The Five Analysis Metrics (Phase 1)
+
+These five metrics are computed on the embedding layer of Pythia-410m to quantify how much information is preserved or destroyed by each averaging method. They do **not** require running the full transformer — only the embedding lookup.
+
+**Variance shrinkage factor**
+Measures how much the spread (variance) of embedding values decreases after averaging. Averaging k i.i.d. random variables reduces variance by exactly 1/k (the Central Limit Theorem). If actual token embeddings were truly independent, we'd see a factor of exactly 1/k. A factor *higher* than 1/k means adjacent tokens are positively correlated (they share information); *lower* would mean they are negatively correlated.
+
+> **Ideal value:** Close to 1.0 (variance well preserved). Values near 0 mean the spread of values has collapsed, which can make it harder for attention layers to distinguish positions.
+
+**Norm shrinkage factor**
+The L2 norm of a vector is its length in the embedding space: `‖v‖₂ = sqrt(v₁² + v₂² + …)`. Averaging compresses the norm. For a model trained with certain norms in its weight matrices, a sudden drop in embedding norm can destabilise attention scores (since dot-product attention is sensitive to magnitude). The norm shrinkage factor is `‖avg(t₁, …, tₖ)‖₂ / ‖t₁‖₂`.
+
+> **Ideal value:** Close to 1.0. Large drops (e.g. factor of 0.3 at k=8) suggest attention would need rescaling.
+
+**Information retention ratio**
+An entropy-based measure: `H(averaged embeddings) / H(original embeddings)`, where H is estimated using a histogram of embedding values. Values close to 1.0 mean the compressed embeddings have approximately as much statistical diversity as the originals. Values above 1.0 can occur due to the Central Limit Theorem smoothing out the distribution and making it look more uniform (higher entropy) even as individual information is lost — this is the "CLT paradox" discussed in the results.
+
+> **Ideal value:** Close to 1.0. Far below 1.0 means significant diversity is lost; above 1.0 suggests the entropy estimator is seeing increased spread from CLT smoothing rather than genuine information gain.
+
+**Spectral energy loss (%)**
+The Fourier transform decomposes the embedding sequence into frequency components — slow trends (low frequencies) and rapid local changes (high frequencies). High-frequency components encode fine-grained positional variation: the fact that token at position 47 is slightly different from token at position 48. Averaging is a low-pass filter: it destroys high-frequency components. Spectral energy loss measures what fraction of the total signal power is wiped out.
+
+> **Ideal value:** Close to 0%. In practice, even k=2 loses 86% of spectral energy, making this the dominant problem signal in Phase 1.
+
+**Rank reduction**
+The embedding matrix (all T token embeddings stacked as rows) has an effective rank — the number of independent dimensions needed to explain 95% of its variance. Averaging tends to reduce rank because it mixes independent directions together. Rank reduction = `(rank_original - rank_averaged) / rank_original`.
+
+> **Ideal value:** Close to 0 (little rank loss). High rank reduction means the geometry of the embedding space is collapsing, which limits the model's representational capacity.
+
+---
+
+### Averaging Methods (Phase 1)
+
+**Uniform averaging**
+All k tokens in a window get equal weight 1/k. The simplest scheme and the Phase 1 baseline.
+
+**Dynamic averaging**
+The window size varies across the sequence. Three strategies:
+- **Alternating** — windows alternate between two sizes, e.g. [2, 3, 2, 3, …]
+- **Random** — each window size is sampled uniformly from a range, e.g. [2, 4] or [2, 8]
+- **Adaptive** — window boundaries are set by cosine similarity: highly similar adjacent pairs are merged (up to a threshold), while dissimilar pairs are kept separate
+
+**Overlapping windows**
+A sliding window of fixed width `w` moves with stride `s`. When `s < w`, consecutive output vectors share some input tokens. This reduces the abruptness of the transition between windows and partially preserves frequency structure, at the cost of lower effective compression (compression ratio = `1 - s/w` rather than `1 - 1/w`).
+
+- `w=4, s=4` — non-overlapping (same as uniform k=4)
+- `w=4, s=2` — 50% overlap (each output shares 2 tokens with its neighbour)
+- `w=4, s=1` — 75% overlap (maximum; very little effective compression)
+
+**Weighted averaging**
+Fixed per-position weights are applied before averaging. The weights are static (not learned):
+- **Linear** — weight increases linearly toward the most recent token
+- **Exponential** — weight decays geometrically from most recent to oldest
+- **Gaussian** — bell curve peaking at the window centre
+- **Triangular** — tent function peaking at the window centre
+
+**Learnable weighted average**
+A small neural module (linear scorer + softmax) learns content-adaptive weights from the token embeddings themselves. Trained with a reconstruction loss (MSE between the output of a decoder and the original embeddings). Unlike fixed-weight schemes, the weights change depending on what the tokens say.
+
+**Weight entropy**
+A single number measuring how concentrated the averaging weights are. Computed as `H(weights) = -Σ wᵢ log wᵢ`. Low entropy = weights are concentrated on one token (selection). High entropy = weights are spread evenly (smoothing). Uniform weights have maximum entropy; exponential weights have lower entropy.
+
+---
+
+### Other Technical Terms
+
+**Pythia-410m**
+A 410-million-parameter autoregressive transformer from EleutherAI. Uses the GPT-NeoX architecture with Rotary Positional Embeddings (RoPE), 1,024-dimensional embeddings, 16 attention layers, and a vocabulary of 50,257 tokens. Used as the source of embeddings in all Phase 1 analyses and as the base model in Phase 2 finetuning and zero-shot experiments.
+
+**WikiText-103**
+A standard language modelling benchmark of 103 million tokens from verified Wikipedia articles. 1,000 sequences from the training split are used to extract embeddings for Phase 1 analysis. 500 sequences from the test split are used for perplexity evaluation in Phase 2.
+
+**Perplexity (PPL)**
+How surprised the model is on average per token. Defined as `exp(mean NLL)`. Lower is always better. Relevant in Phase 2 (LLM experiments). See the Glossary in `experiment_analysis.md` for a full reference table.
+
+**Cosine similarity**
+A measure of how "similar" two vectors are regardless of their lengths: `cos(θ) = (a · b) / (‖a‖ ‖b‖)`. Values range from −1 (opposite directions) to +1 (same direction). Used in the adaptive dynamic strategy to decide whether adjacent tokens are similar enough to merge.
+
+**SVD (Singular Value Decomposition)**
+A matrix factorisation that reveals the principal axes of variation in a dataset. Used in rank analysis: the effective rank is the number of singular values needed to explain 95% of the total variance. A lower effective rank after averaging means the compressed embeddings span fewer independent directions.
+
+**CLT (Central Limit Theorem)**
+A statistical theorem stating that the average of many independent random variables tends toward a Gaussian distribution. When k embeddings are averaged, their values smooth out toward a more Gaussian-shaped distribution. This *increases* estimated entropy (more uniform histogram) while simultaneously destroying fine-grained local variation — the "CLT paradox" that makes `info_retention_ratio > 1.0` at moderate k values.
+
+**Low-pass filter**
+A signal processing term for any operation that keeps slow, broad patterns (low frequencies) while destroying rapid local fluctuations (high frequencies). Averaging is a low-pass filter: the spectral energy that lives in high-frequency components — which encode short-range token-to-token variation — is wiped out. This is the primary mechanism of information loss in token averaging.
 
 ---
 
@@ -174,7 +317,7 @@ Var(x̃) = (1/k)·Var(x)  +  (2/k²)·Σ Cov(x_i, x_j)
 
 At small k the covariance correction term is small (only adjacent pairs). At large k, the sum runs over all O(k²) pairs, and even weak correlations accumulate. Variance is collapsing — but more slowly than it would if tokens were independent.
 
-**Plots:** [`outputs/uniform/k_2/embedding/covariance_decay.png`](../outputs/uniform/k_2/embedding/covariance_decay.png) shows how covariance decays with token distance at k=2. Repeat at [`k_8`](../outputs/uniform/k_8/embedding/covariance_decay.png) to see how the window captures more covariance at larger k.
+**Plots:** ![outputs/uniform/k_uniform_k2/embedding/covariance_decay.png](../outputs/uniform/k_uniform_k2/embedding/covariance_decay.png) shows how covariance decays with token distance at k=2. Repeat at ![k_8](../outputs/uniform/k_uniform_k8/embedding/covariance_decay.png) to see how the window captures more covariance at larger k.
 
 ---
 
@@ -193,9 +336,9 @@ The jump from k=1 (0%) to k=2 (86.1%) is the critical discontinuity. Doubling co
 The high-frequency loss stabilises quickly too — it plateaus near 62% by k=8 and barely changes thereafter. This plateau tells us that after k=8, averaging has already eliminated all the high-frequency content that is going to be eliminated; further merging only removes low-to-mid frequency energy.
 
 **Plots:** Spectrum comparison at each k:
-- k=2: [`outputs/uniform/k_2/embedding/spectrum_comparison.png`](../outputs/uniform/k_2/embedding/spectrum_comparison.png)
-- k=4: [`outputs/uniform/k_4/embedding/spectrum_comparison.png`](../outputs/uniform/k_4/embedding/spectrum_comparison.png)
-- k=8: [`outputs/uniform/k_8/embedding/spectrum_comparison.png`](../outputs/uniform/k_8/embedding/spectrum_comparison.png)
+- k=2: ![outputs/uniform/k_uniform_k2/embedding/spectrum_comparison.png](../outputs/uniform/k_uniform_k2/embedding/spectrum_comparison.png)
+- k=4: ![outputs/uniform/k_uniform_k4/embedding/spectrum_comparison.png](../outputs/uniform/k_uniform_k4/embedding/spectrum_comparison.png)
+- k=8: ![outputs/uniform/k_uniform_k8/embedding/spectrum_comparison.png](../outputs/uniform/k_uniform_k8/embedding/spectrum_comparison.png)
 
 ---
 
@@ -211,7 +354,7 @@ The high-frequency loss stabilises quickly too — it plateaus near 62% by k=8 a
 
 The norm shrinks more slowly than 1/√k at every k — again because of positive token correlations. However, even with this partial correction, at k=2 the norm drops to 78% of its original value. Every attention logit involving an averaged embedding is proportionally reduced, which would shift attention distributions toward more uniform patterns.
 
-**Plots:** [`outputs/uniform/k_2/embedding/norm_distribution.png`](../outputs/uniform/k_2/embedding/norm_distribution.png) — histogram of norms before and after compression.
+**Plots:** ![outputs/uniform/k_uniform_k2/embedding/norm_distribution.png](../outputs/uniform/k_uniform_k2/embedding/norm_distribution.png) — histogram of norms before and after compression.
 
 ---
 
@@ -232,9 +375,9 @@ Rank reduction is **non-linear with k**: the first doubling (k=1→2) loses only
 The rate of rank reduction per token compressed accelerates: from 18 lost at 2× compression to 661 lost at 128× compression. The compressed representation becomes increasingly low-rank relative to its length.
 
 **Plots:**
-- k=2: [`outputs/uniform/k_2/embedding/singular_values_comparison.png`](../outputs/uniform/k_2/embedding/singular_values_comparison.png)
-- k=8: [`outputs/uniform/k_8/embedding/singular_values_comparison.png`](../outputs/uniform/k_8/embedding/singular_values_comparison.png)
-- k=32: [`outputs/uniform/k_32/embedding/singular_values_comparison.png`](../outputs/uniform/k_32/embedding/singular_values_comparison.png)
+- k=2: ![outputs/uniform/k_uniform_k2/embedding/singular_values_comparison.png](../outputs/uniform/k_uniform_k2/embedding/singular_values_comparison.png)
+- k=8: ![outputs/uniform/k_uniform_k8/embedding/singular_values_comparison.png](../outputs/uniform/k_uniform_k8/embedding/singular_values_comparison.png)
+- k=32: ![outputs/uniform/k_uniform_k32/embedding/singular_values_comparison.png](../outputs/uniform/k_uniform_k32/embedding/singular_values_comparison.png)
 
 ---
 
@@ -283,6 +426,11 @@ The alternating schedule cycles [2, 3, 2, 3, …], giving an average group size 
 
 Alternating sits between uniform k=2 and k=4 on every metric, tracking its effective average group size. It offers no advantage over simply choosing a fixed k equal to the desired average — the irregular grouping adds complexity without improving information preservation.
 
+**Plots:**
+- Spectrum comparison: ![outputs/dynamic/k_alternating_2_3/embedding/spectrum_comparison.png](../outputs/dynamic/k_alternating_2_3/embedding/spectrum_comparison.png)
+- Covariance decay: ![outputs/dynamic/k_alternating_2_3/embedding/covariance_decay.png](../outputs/dynamic/k_alternating_2_3/embedding/covariance_decay.png)
+- Norm distribution: ![outputs/dynamic/k_alternating_2_3/embedding/norm_distribution.png](../outputs/dynamic/k_alternating_2_3/embedding/norm_distribution.png)
+
 ---
 
 ### 5.2 Random [2,4] and Random [2,8] — effect of variance in group size
@@ -299,6 +447,11 @@ The random strategies let each group size be drawn uniformly at random from [k_m
 The metrics track average group size closely: random [2,4] with avg≈3.0 falls very close to where a uniform k=3 would land. The width of the group-size range has minimal effect beyond its influence on the mean. **Dynamic group sizes do not offer any information-preservation advantage over a fixed k equal to the mean group size.**
 
 Random [2,8] is notable because it is the **only configuration in the entire experiment with an info_retention_ratio below 1.0** (value: 0.973). When the average group size exceeds ≈4–5 tokens, the per-dimension entropy begins to genuinely decrease — the CLT-smoothing effect that creates the >1.0 illusion is overwhelmed by actual information loss. This marks the regime where compression becomes genuinely detrimental on this metric.
+
+**Plots:**
+- Random [2,4] spectrum: ![outputs/dynamic/k_random_2_4/embedding/spectrum_comparison.png](../outputs/dynamic/k_random_2_4/embedding/spectrum_comparison.png)
+- Random [2,8] spectrum: ![outputs/dynamic/k_random_2_8/embedding/spectrum_comparison.png](../outputs/dynamic/k_random_2_8/embedding/spectrum_comparison.png)
+- Random [2,8] singular values: ![outputs/dynamic/k_random_2_8/embedding/singular_values_comparison.png](../outputs/dynamic/k_random_2_8/embedding/singular_values_comparison.png)
 
 ---
 
@@ -318,6 +471,11 @@ This is the experiment's most important negative result: **the fundamental premi
 
 **Why the apparent metric "improvement" at adaptive?** The variance shrinkage is 0.770 and norm is 1.053 — seemingly better than the other strategies. This is not a real signal. With only 2% of tokens merged, the sequence is essentially unchanged, and the compressed embeddings that were merged happen to be aligned (high cosine similarity → similar vectors → averaging produces a vector with nearly the same magnitude as each individual). For context extension purposes, a 2% reduction in sequence length is meaningless.
 
+**Plots:**
+- Adaptive sim=0.75 covariance decay: ![outputs/dynamic/k_adaptive_sim75/embedding/covariance_decay.png](../outputs/dynamic/k_adaptive_sim75/embedding/covariance_decay.png)
+- Adaptive sim=0.95 covariance decay: ![outputs/dynamic/k_adaptive_sim95/embedding/covariance_decay.png](../outputs/dynamic/k_adaptive_sim95/embedding/covariance_decay.png) — identical to sim=0.75, confirming the bimodal cosine-similarity distribution finding
+- Adaptive norm distribution: ![outputs/dynamic/k_adaptive_sim75/embedding/norm_distribution.png](../outputs/dynamic/k_adaptive_sim75/embedding/norm_distribution.png)
+
 ---
 
 ### 5.4 Comparing all strategies at their spectral loss
@@ -331,6 +489,8 @@ This is the experiment's most important negative result: **the fundamental premi
 | random [2,8] | 98.9% | ~9% fewer tokens |
 
 The striking observation here is that **adaptive achieves 93.3% spectral loss while only compressing 2% of the sequence**. Uniform k=2, which achieves the same spectral damage profile, compresses 50%. The adaptive strategy is not "better at preserving spectral energy while compressing" — it merely compresses almost nothing, making the spectral comparison misleading.
+
+→ Cross-method spectral comparison chart: ![outputs/comparison_chart.png](../outputs/comparison_chart.png)
 
 ---
 
@@ -350,7 +510,7 @@ When s = w: identical to uniform w-averaging (no overlap).
 When s = 1: every output token is the average of its w-token neighbourhood; output length ≈ input length (no compression).
 
 **Data source:** [`outputs/overlapping/metrics/overlapping_metrics.csv`](../outputs/overlapping/metrics/overlapping_metrics.csv)  
-**Heatmap:** [`outputs/overlapping/heatmaps/heatmap_embedding_spectral_total_energy_loss_percentage.png`](../outputs/overlapping/heatmaps/heatmap_embedding_spectral_total_energy_loss_percentage.png)
+**Heatmap:** `outputs/overlapping/heatmaps/heatmap_embedding_spectral_total_energy_loss_percentage.png`
 
 ---
 
@@ -382,8 +542,8 @@ When s = 1: every output token is the average of its w-token neighbourhood; outp
 With a window of 2, changing stride from 1 to 2 destroys 41 additional percentage points of spectral energy while changing almost nothing else. The non-spectral metrics (variance, norm, rank) are nearly identical — both strides apply exactly the same 2-token average to each output position. The only difference is whether consecutive output tokens overlap in their source tokens. That single degree of freedom controls spectral loss almost entirely.
 
 **Plots:**
-- Stride 1: [`outputs/overlapping/w2_s1/embedding/spectrum_comparison.png`](../outputs/overlapping/w2_s1/embedding/spectrum_comparison.png)
-- Stride 2: [`outputs/overlapping/w2_s2/embedding/spectrum_comparison.png`](../outputs/overlapping/w2_s2/embedding/spectrum_comparison.png)
+- Stride 1: ![outputs/overlapping/k_w2_s1/embedding/spectrum_comparison.png](../outputs/overlapping/k_w2_s1/embedding/spectrum_comparison.png)
+- Stride 2: ![outputs/overlapping/k_w2_s2/embedding/spectrum_comparison.png](../outputs/overlapping/k_w2_s2/embedding/spectrum_comparison.png)
 
 ---
 
@@ -399,9 +559,9 @@ With a window of 2, changing stride from 1 to 2 destroys 41 additional percentag
 The pattern holds: stride completely controls spectral loss; window size controls everything else. The progression from stride=1 → stride=2 → stride=4 is monotonically increasing spectral loss (+25.0 pp, then +6.3 pp), with the biggest jump from full overlap to half-overlap.
 
 **Plots:**
-- Stride 1: [`outputs/overlapping/w4_s1/embedding/spectrum_comparison.png`](../outputs/overlapping/w4_s1/embedding/spectrum_comparison.png)
-- Stride 2: [`outputs/overlapping/w4_s2/embedding/spectrum_comparison.png`](../outputs/overlapping/w4_s2/embedding/spectrum_comparison.png)
-- Stride 4 (= uniform k=4): [`outputs/uniform/k_4/embedding/spectrum_comparison.png`](../outputs/uniform/k_4/embedding/spectrum_comparison.png)
+- Stride 1: ![outputs/overlapping/k_w4_s1/embedding/spectrum_comparison.png](../outputs/overlapping/k_w4_s1/embedding/spectrum_comparison.png)
+- Stride 2: ![outputs/overlapping/k_w4_s2/embedding/spectrum_comparison.png](../outputs/overlapping/k_w4_s2/embedding/spectrum_comparison.png)
+- Stride 4 (= uniform k=4): ![outputs/uniform/k_uniform_k4/embedding/spectrum_comparison.png](../outputs/uniform/k_uniform_k4/embedding/spectrum_comparison.png)
 
 ---
 
@@ -417,8 +577,8 @@ The pattern holds: stride completely controls spectral loss; window size control
 At w=8, even stride=1 (maximum overlap) cannot escape 77.8% spectral loss. Averaging 8 tokens together is so destructive to high-frequency structure that even eliminating all window-boundary discontinuities can only partially mitigate the damage. The gain from overlapping shrinks as w increases: the boundary effect matters less when the individual averaging is already so destructive.
 
 **Plots:**
-- Stride 1: [`outputs/overlapping/w8_s1/embedding/spectrum_comparison.png`](../outputs/overlapping/w8_s1/embedding/spectrum_comparison.png)
-- Stride 8: [`outputs/overlapping/w8_s8/embedding/spectrum_comparison.png`](../outputs/overlapping/w8_s8/embedding/spectrum_comparison.png)
+- Stride 1: ![outputs/overlapping/k_w8_s1/embedding/spectrum_comparison.png](../outputs/overlapping/k_w8_s1/embedding/spectrum_comparison.png)
+- Stride 8: ![outputs/overlapping/k_w8_s8/embedding/spectrum_comparison.png](../outputs/overlapping/k_w8_s8/embedding/spectrum_comparison.png)
 
 ---
 
@@ -472,7 +632,7 @@ Instead of equal weights, each position within the k-token window receives a sta
 - **Triangular:** linear ramp up then ramp down, peak at centre
 
 **Data source:** [`outputs/weighted/metrics/weighted_metrics.csv`](../outputs/weighted/metrics/weighted_metrics.csv)  
-**Weight profiles:** [`outputs/weighted/plots/weight_profiles.png`](../outputs/weighted/plots/weight_profiles.png)
+**Weight profiles:** `outputs/weighted/plots/weight_profiles.png`
 
 ---
 
@@ -533,6 +693,11 @@ Instead of equal weights, each position within the k-token window receives a sta
 
 Every scheme declines with k, but exponential declines most slowly — its advantage over uniform at k=2 (0.910 vs 0.521, ratio 1.75×) narrows at k=16 (0.147 vs 0.109, ratio 1.35×). Triangular is anomalously high at k=4 (0.522) — see below.
 
+**Plots (singular values and spectrum per scheme at k=2):**
+- Exponential k=2: ![outputs/weighted/k_exponential_k2/embedding/singular_values_comparison.png](../outputs/weighted/k_exponential_k2/embedding/singular_values_comparison.png) | ![spectrum_comparison.png](../outputs/weighted/k_exponential_k2/embedding/spectrum_comparison.png)
+- Linear k=2: ![outputs/weighted/k_linear_k2/embedding/singular_values_comparison.png](../outputs/weighted/k_linear_k2/embedding/singular_values_comparison.png) | ![spectrum_comparison.png](../outputs/weighted/k_linear_k2/embedding/spectrum_comparison.png)
+- Gaussian k=2: ![outputs/weighted/k_gaussian_k2/embedding/singular_values_comparison.png](../outputs/weighted/k_gaussian_k2/embedding/singular_values_comparison.png)
+
 **Spectral loss across k:**
 
 | k | uniform | linear | exponential | gaussian | triangular |
@@ -543,6 +708,11 @@ Every scheme declines with k, but exponential declines most slowly — its advan
 | 16 | 99.9% | 99.9% | 99.9% | 99.9% | 99.9% |
 
 By k=8, all schemes have converged to ≈99.5%+ spectral loss — the weight distribution no longer matters. The small gains at k=2 (uniform 86.1% vs exponential 77.1%) are real but contextually small: even the "best" scheme at the mildest compression destroys 77% of spectral energy.
+
+**Plots (spectral at k=8 for each scheme):**
+- Exponential k=8: ![outputs/weighted/k_exponential_k8/embedding/spectrum_comparison.png](../outputs/weighted/k_exponential_k8/embedding/spectrum_comparison.png)
+- Uniform k=8: ![outputs/weighted/k_uniform_k8/embedding/spectrum_comparison.png](../outputs/weighted/k_uniform_k8/embedding/spectrum_comparison.png)
+- Gaussian k=8: ![outputs/weighted/k_gaussian_k8/embedding/spectrum_comparison.png](../outputs/weighted/k_gaussian_k8/embedding/spectrum_comparison.png)
 
 ---
 
@@ -559,6 +729,8 @@ After normalisation = [0.00, 0.50, 0.50, 0.00]
 The outer two tokens receive zero weight. The triangular scheme at k=4 is **exactly equivalent to uniform averaging of just the 2 middle tokens**. It discards half the window and averages the other half. This is why its variance (0.522) and norm (0.779) match uniform k=2 almost exactly, and why it achieves lower rank reduction (24 vs 54) — only a k=2 compression is actually happening.
 
 The practical implication: triangular is claiming 4× compression by skipping one token in every four, but computing only a 2-token average from the middle pair. This is a hybrid of selection and averaging, not genuine 4-token fusion.
+
+→ ![outputs/weighted/k_triangular_k4/embedding/singular_values_comparison.png](../outputs/weighted/k_triangular_k4/embedding/singular_values_comparison.png) — note how the singular value profile almost exactly matches the uniform k=2 profile, confirming that only 2 effective tokens are being merged.
 
 ---
 
@@ -582,6 +754,10 @@ The preservation-compression trade-off across all schemes at k=2:
 | gaussian/triangular | = uniform at k=2 | 0.521 | 86.1% | equal fusion |
 
 **No scheme simultaneously achieves both genuine compression (equal fusion of all k tokens) and high preservation metrics.** The Pareto frontier runs from "equal fusion + low metrics" to "near-selection + high metrics". There is no sweet spot in between where metrics are high and information is genuinely fused.
+
+**Plots comparing the selection vs. fusion trade-off:**
+- Exponential k=2 norm (high norm = near-selection): ![outputs/weighted/k_exponential_k2/embedding/norm_distribution.png](../outputs/weighted/k_exponential_k2/embedding/norm_distribution.png)
+- Uniform k=2 norm (lower norm = genuine averaging): ![outputs/weighted/k_uniform_k2/embedding/norm_distribution.png](../outputs/weighted/k_uniform_k2/embedding/norm_distribution.png)
 
 ---
 
@@ -613,8 +789,8 @@ Training data: all layers' embeddings concatenated, 500 sequences, 3 epochs, Ada
 | 8 | 0.173 | 0.167 | +0.006 | 0.538 | 0.528 | +0.010 | 99.6% | 99.6% | 0.0 pp | **219** | **119** | **+100** | 1.50 × 10⁻⁴ |
 
 **Plots:**
-- Weight profiles: [`outputs/learnable/plots/weight_profile_k2.png`](../outputs/learnable/plots/weight_profile_k2.png), [`weight_profile_k4.png`](../outputs/learnable/plots/weight_profile_k4.png), [`weight_profile_k8.png`](../outputs/learnable/plots/weight_profile_k8.png)
-- Training loss: [`outputs/learnable/plots/loss_curve_k2.png`](../outputs/learnable/plots/loss_curve_k2.png), [`loss_curve_k4.png`](../outputs/learnable/plots/loss_curve_k4.png), [`loss_curve_k8.png`](../outputs/learnable/plots/loss_curve_k8.png)
+- Weight profiles: `outputs/learnable/plots/weight_profile_k2.png`, `weight_profile_k4.png`, `weight_profile_k8.png`
+- Training loss: `outputs/learnable/plots/loss_curve_k2.png`, `loss_curve_k4.png`, `loss_curve_k8.png`
 
 ---
 
@@ -628,7 +804,7 @@ Training data: all layers' embeddings concatenated, 500 sequences, 3 epochs, Ada
 
 The reconstruction loss grows with k as expected — compressing more tokens into one makes the reconstruction task harder. However, the increase is modest (1.5× from k=2 to k=8), and more importantly, the loss converges: training curves show stable minima within 3 epochs for all k values. The network is not failing to converge; it is converging to a solution that does not improve over uniform averaging on the preserved-signal metrics.
 
-**Training loss plots:** [`outputs/learnable/plots/loss_curve_k2.png`](../outputs/learnable/plots/loss_curve_k2.png) shows the training curve over 3 epochs.
+**Training loss plots:** `outputs/learnable/plots/loss_curve_k2.png` shows the training curve over 3 epochs.
 
 ---
 
@@ -637,6 +813,8 @@ The reconstruction loss grows with k as expected — compressing more tokens int
 The Δ columns above show the key result: across all k values, variance and spectral loss differ from uniform by less than 1% absolutely. At k=4 and k=8, the spectral loss is identical to 1 decimal place. The learned content-dependent weights produce the same geometric compression as equal weights.
 
 The weight profiles confirm this: the mean attention weight at each window position is approximately 1/k across all positions. No position is systematically up- or down-weighted. The network discovered uniform averaging independently.
+
+→ Weight profiles: `outputs/learnable/plots/weight_profile_k2.png`, `weight_profile_k4.png`, `weight_profile_k8.png` — each shows a near-flat distribution across k positions, confirming convergence to approximately uniform weights.
 
 ---
 
@@ -655,6 +833,13 @@ The learnable averager reduces effective rank 2–2.5× more than uniform averag
 The explanation is subtle: even near-uniform weights that have small per-token variation introduce a systematic **directional bias** in the compressed representations. Uniform averaging is a maximally symmetric operation — it treats all positions equally, which preserves the statistical distribution of embedding directions as broadly as possible. Learned weights, even when nearly equal, are optimised to minimise MSE, which inadvertently collapses some directions that contribute to reconstruction error (outlier-direction components get slightly down-weighted). The result is a slight but consistent dimensional collapse.
 
 This is a genuine finding: **the learnable averager is strictly worse than uniform on rank preservation**, despite achieving similar metrics on all other dimensions. Adding learned weights does not help, and on geometric dimensionality it actively hurts.
+
+**Plots (learnable vs uniform rank comparison):**
+- Learnable k=2 singular values: ![outputs/learnable/k_learned_k2/embedding/singular_values_comparison.png](../outputs/learnable/k_learned_k2/embedding/singular_values_comparison.png)
+- Learnable k=4 singular values: ![outputs/learnable/k_learned_k4/embedding/singular_values_comparison.png](../outputs/learnable/k_learned_k4/embedding/singular_values_comparison.png)
+- Learnable k=8 singular values: ![outputs/learnable/k_learned_k8/embedding/singular_values_comparison.png](../outputs/learnable/k_learned_k8/embedding/singular_values_comparison.png)
+
+Compare against the corresponding uniform plots (![k=2](../outputs/uniform/k_uniform_k2/embedding/singular_values_comparison.png), ![k=4](../outputs/uniform/k_uniform_k4/embedding/singular_values_comparison.png), ![k=8](../outputs/uniform/k_uniform_k8/embedding/singular_values_comparison.png)) — the learnable plots show a sharper singular value drop-off, confirming the 2–2.5× greater rank reduction.
 
 ---
 
@@ -679,7 +864,7 @@ The learnable averager falls at or below the uniform baseline on every metric. I
 ## 9. Cross-Method Comparison
 
 **Data source:** [`outputs/comparison_report.md`](../outputs/comparison_report.md)  
-**Chart:** [`outputs/comparison_chart.png`](../outputs/comparison_chart.png)
+**Chart:** ![outputs/comparison_chart.png](../outputs/comparison_chart.png)
 
 ### Summary table — means across all configurations per method
 
@@ -753,11 +938,15 @@ At k=2 (the mildest compression), uniform averaging destroys 86.1% of total spec
 
 **Implication:** any model receiving averaged tokens sees a qualitatively different signal from what it was trained on, regardless of how the averaging is performed.
 
+→ ![outputs/uniform/k_uniform_k2/embedding/spectrum_comparison.png](../outputs/uniform/k_uniform_k2/embedding/spectrum_comparison.png) and ![k_uniform_k4/embedding/spectrum_comparison.png](../outputs/uniform/k_uniform_k4/embedding/spectrum_comparison.png) — the power spectrum plots make the 86% and 98% energy loss immediately visible as the averaged spectrum dropping to near-zero above the fundamental frequencies.
+
 ### Finding 2 — Adjacent token embeddings are not meaningfully redundant
 
 The adaptive dynamic strategy, which only merges tokens when their cosine similarity exceeds a threshold, merged just 16 of 759 tokens (2.1%) even at the lowest threshold of 0.75. The premise of token averaging — that consecutive tokens carry overlapping information — does not hold at the embedding layer.
 
 **Implication:** content-adaptive merging cannot salvage the approach because there are simply not enough redundant token pairs to compress.
+
+→ ![outputs/dynamic/k_adaptive_sim75/embedding/covariance_decay.png](../outputs/dynamic/k_adaptive_sim75/embedding/covariance_decay.png) — covariance between adjacent tokens falls off sharply; the near-zero values beyond token distance 1 confirm that the embedding space is non-redundant.
 
 ### Finding 3 — Variance shrinks close to 1/k, but slightly above
 
@@ -765,23 +954,34 @@ Actual shrinkage at k=2 (0.521) is above the theoretical prediction of 0.5 for i
 
 **Implication:** the theoretical lower bound on information loss is partially offset by real-language correlations, but not enough to make the compression viable.
 
+→ ![outputs/uniform/k_uniform_k2/embedding/covariance_decay.png](../outputs/uniform/k_uniform_k2/embedding/covariance_decay.png) — the slow covariance decay explains why actual variance shrinkage (0.521) is above the uncorrelated prediction (0.500).
+
 ### Finding 4 — Overlapping windows halve spectral loss at the cost of zero compression
 
 stride=1 configurations achieve 44.7% spectral loss (window=2) vs 86.1% for stride=window. The spectral damage comes from the hard boundaries between non-overlapping windows, not from the averaging itself. But stride=1 produces no compression — output length ≈ input length.
 
 **Implication:** if spectral preservation is required, overlapping averaging is the right approach, but it must be combined with a subsequent compression step (e.g. learnable pooling) to achieve any context extension.
 
+→ ![outputs/overlapping/k_w2_s1/embedding/spectrum_comparison.png](../outputs/overlapping/k_w2_s1/embedding/spectrum_comparison.png) (stride=1, 44.7% loss) vs ![outputs/overlapping/k_w2_s2/embedding/spectrum_comparison.png](../outputs/overlapping/k_w2_s2/embedding/spectrum_comparison.png) (stride=2, 86.1% loss) — the side-by-side shows exactly how much spectral energy overlap recovers.
+
 ### Finding 5 — Better-preserving weight schemes select rather than average
 
 Exponential weighting achieves 0.910 variance preservation at k=2 (vs 0.521 uniform), but this is because it assigns ~95% of the weight to the last token. The scheme is effectively discarding k−1 tokens and passing one through. This does extend the context window (k−1 tokens are dropped), but it loses most of the information from those tokens rather than fusing it.
+
+→ ![outputs/weighted/k_exponential_k2/embedding/norm_distribution.png](../outputs/weighted/k_exponential_k2/embedding/norm_distribution.png) — exponential k=2 norms nearly match the original token norm distribution (near-1.0 shrinkage), a signature of token selection rather than true averaging.
 
 ### Finding 6 — Learned averaging converges to uniform
 
 The trained neural averager with a linear scoring head converges to near-uniform weights across all k values (delta < 1% on all metrics vs uniform baseline). The embedding layer is information-diffuse — no token in a window is systematically more informative, so the optimal static aggregation is equal weighting.
 
+→ `outputs/learnable/plots/weight_profile_k4.png` — the weight profile at k=4 shows approximately flat weights across all four positions, confirming convergence to uniform.
+
 ### Finding 7 — Rank reduction is benign at k=2
 
 The effective rank drops from 759 to 741 at k=2 — only 18 dimensions lost. This suggests that the compressed embeddings still span nearly the same geometric subspace as the originals. If rank collapse were the main concern, k=2 compression would be safe. The spectral problem is more fundamental.
+
+→ ![outputs/uniform/k_uniform_k2/embedding/singular_values_comparison.png](../outputs/uniform/k_uniform_k2/embedding/singular_values_comparison.png) — the singular value spectra of original vs averaged are nearly indistinguishable at k=2, confirming the benign rank reduction.  
+→ ![outputs/uniform/k_uniform_k8/embedding/singular_values_comparison.png](../outputs/uniform/k_uniform_k8/embedding/singular_values_comparison.png) — at k=8 the averaged spectrum collapses noticeably, showing where rank reduction becomes a genuine concern.
 
 ---
 
