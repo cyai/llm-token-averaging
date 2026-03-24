@@ -1,38 +1,38 @@
 """
 Unified training script for the Chinchilla FLOPs comparison experiment.
 
-Supports both single-GPU and multi-GPU (DDP via torchrun) training.
+Uses OLM's distributed training utilities for multi-GPU DDP:
+  olm.core.dist.setup_distributed()   — init NCCL process group
+  olm.core.dist.get_local_rank()      — local GPU index for this process
+  olm.core.dist.get_rank()            — global rank
+  olm.core.dist.get_world_size()      — total number of GPUs
+  olm.core.dist.is_main_process()     — True only on rank 0
+
+See: https://github.com/openlanguagemodel/openlanguagemodel/blob/main/docs/datasets-and-training.md
+
+The training loop itself is kept custom because OLM's DDPTrainer does not
+support the averaged-LM forward interface (OLMAveragedLanguageModel) or the
+FLOPs-accounting / CSV logging we need.  However all distributed plumbing
+delegates to OLM's dist module.
 
 Single-GPU
 ----------
     python experiments/chinchilla/train.py \
         --model model1_125m --batch_size 16 --device cuda
 
-8-GPU DDP (recommended for 8× A6000)
---------------------------------------
+8-GPU DDP on 8× A6000 (recommended)
+-------------------------------------
     torchrun --standalone --nproc_per_node=8 \
         experiments/chinchilla/train.py \
         --model model1_125m --batch_size 16
 
-    # batch_size is per-GPU; global effective batch = batch_size × 8 GPUs
+    # batch_size is per GPU; global effective batch = batch_size × 8
 
-Resume interrupted DDP run
----------------------------
+Resume
+------
     torchrun --standalone --nproc_per_node=8 \
         experiments/chinchilla/train.py \
         --model model2_500m --batch_size 8 --resume
-
-Notes
------
-* LOCAL_RANK / WORLD_SIZE / RANK are set automatically by torchrun.
-* When world_size > 1 the model is wrapped in DistributedDataParallel.
-* Each GPU receives a disjoint shard of the FineWeb document stream.
-* CSV logging, checkpointing, and stdout progress are rank-0 only.
-* FLOPs are accumulated globally across all GPUs (world_size * per-GPU FLOPs).
-* With 8× A6000 (48 GB each, ~155 TFLOPS BF16):
-    model1_125m  ≈ 3–4 h
-    avg_125m_k2  ≈ 1.5–2 h
-    model2_500m  ≈ 12–14 h   (no grad-ckpt needed on 48 GB)
 """
 
 from __future__ import annotations
@@ -46,7 +46,6 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import checkpoint as gradient_checkpoint
@@ -63,12 +62,13 @@ from experiments.shared.averaged_lm import build_method_config
 
 
 # ---------------------------------------------------------------------------
-# DDP setup helpers
+# OLM distributed utilities  (with graceful fallback to raw torch.distributed)
 # ---------------------------------------------------------------------------
 
-def _setup_ddp() -> tuple[int, int, int]:
+def _setup_distributed() -> tuple[int, int, int]:
     """
-    Initialise the default process group if torchrun set LOCAL_RANK.
+    Initialise the distributed process group using OLM's setup_distributed(),
+    falling back to raw torch.distributed if OLM is not available.
 
     Returns:
         (local_rank, global_rank, world_size)
@@ -77,24 +77,70 @@ def _setup_ddp() -> tuple[int, int, int]:
     global_rank = int(os.environ.get("RANK",        0))
     world_size  = int(os.environ.get("WORLD_SIZE",  1))
 
-    if world_size > 1:
-        dist.init_process_group(backend="nccl")
-        torch.cuda.set_device(local_rank)
+    if world_size == 1:
+        return local_rank, global_rank, world_size
 
+    try:
+        # OLM-native distributed init (auto-detects NCCL for GPU, Gloo for CPU)
+        from olm.core.dist import setup_distributed
+        setup_distributed()
+    except ImportError:
+        import torch.distributed as dist
+        dist.init_process_group(backend="nccl")
+
+    torch.cuda.set_device(local_rank)
     return local_rank, global_rank, world_size
 
 
-def _cleanup_ddp(world_size: int) -> None:
-    if world_size > 1 and dist.is_initialized():
-        dist.destroy_process_group()
+def _cleanup_distributed(world_size: int) -> None:
+    if world_size <= 1:
+        return
+    try:
+        from olm.core.dist import cleanup_distributed
+        cleanup_distributed()
+    except (ImportError, AttributeError):
+        import torch.distributed as dist
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _get_rank() -> int:
+    try:
+        from olm.core.dist import get_rank
+        return get_rank()
+    except ImportError:
+        return int(os.environ.get("RANK", 0))
+
+
+def _get_world_size() -> int:
+    try:
+        from olm.core.dist import get_world_size
+        return get_world_size()
+    except ImportError:
+        return int(os.environ.get("WORLD_SIZE", 1))
+
+
+def _is_main_process() -> bool:
+    try:
+        from olm.core.dist import is_main_process
+        return is_main_process()
+    except ImportError:
+        return int(os.environ.get("RANK", 0)) == 0
 
 
 def _all_reduce_mean(tensor: torch.Tensor, world_size: int) -> torch.Tensor:
     """Average a scalar tensor across all ranks."""
     if world_size > 1:
+        import torch.distributed as dist
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         tensor /= world_size
     return tensor
+
+
+def _barrier(world_size: int) -> None:
+    if world_size > 1:
+        import torch.distributed as dist
+        dist.barrier()
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +148,7 @@ def _all_reduce_mean(tensor: torch.Tensor, world_size: int) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 def _build_optimizer(model: nn.Module, lr: float, weight_decay: float = 0.1):
-    """AdamW with OLM-style parameter grouping (1-D tensors skip weight decay)."""
+    """OLM AdamW with standard parameter grouping (1-D tensors skip decay)."""
     try:
         from olm.train.optim import AdamW as OLMAdamW
         optimizer_cls = OLMAdamW
@@ -153,7 +199,11 @@ def _eval_loss(
     for i, batch in enumerate(eval_dl):
         if i >= max_batches:
             break
-        input_ids = batch.to(device)
+        # OLM DataLoader returns dicts; fallback returns raw tensors
+        if isinstance(batch, dict):
+            input_ids = batch["input_ids"].to(device)
+        else:
+            input_ids = batch.to(device)
 
         if is_averaged:
             loss, _ = model(input_ids)
@@ -165,7 +215,6 @@ def _eval_loss(
                 logits.reshape(-1, logits.size(-1)),
                 labels.reshape(-1),
             )
-
         total_loss += loss.item()
         count += 1
 
@@ -183,7 +232,7 @@ def train_model(
     results_dir: Optional[Path] = None,
 ) -> Path:
     """
-    Train a single model config, optionally across multiple GPUs via DDP.
+    Train a single model config, optionally across multiple GPUs via OLM DDP.
 
     Args:
         cfg         : ModelConfig (architecture + training budget)
@@ -193,17 +242,21 @@ def train_model(
     Returns:
         Path to loss_log.csv (only meaningful on rank 0).
     """
-    # --- DDP init -----------------------------------------------------------
-    local_rank, global_rank, world_size = _setup_ddp()
-    is_main = global_rank == 0
+    # --- OLM distributed setup ----------------------------------------------
+    local_rank, global_rank, world_size = _setup_distributed()
+    is_main = _is_main_process()
 
-    # Determine device: torchrun sets LOCAL_RANK → use that GPU
-    if world_size > 1:
-        device = f"cuda:{local_rank}"
-    else:
-        device = args.device
+    device = f"cuda:{local_rank}" if world_size > 1 else args.device
 
-    # --- directories (rank 0 creates them; others wait) ---------------------
+    if is_main:
+        print(
+            f"[{cfg.name}] Distributed setup: "
+            f"world_size={world_size}, local_rank={local_rank}, "
+            f"device={device}",
+            flush=True,
+        )
+
+    # --- directories (rank 0 creates; barrier ensures others see them) ------
     if results_dir is None:
         results_dir = _ROOT / "experiments" / "chinchilla" / "results" / cfg.name
     results_dir = Path(results_dir)
@@ -211,8 +264,7 @@ def train_model(
     if is_main:
         results_dir.mkdir(parents=True, exist_ok=True)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-    if world_size > 1:
-        dist.barrier()
+    _barrier(world_size)
 
     log_path = results_dir / "loss_log.csv"
 
@@ -221,27 +273,34 @@ def train_model(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # --- data (each rank gets its own shard) --------------------------------
+    # --- data  (OLM DataLoader handles DDP sharding via distributed=True) ---
     if is_main:
-        print(f"[{cfg.name}] Building FineWeb dataloaders "
-              f"(rank {global_rank}/{world_size}) …", flush=True)
+        print(
+            f"[{cfg.name}] Building FineWeb dataloaders "
+            f"(distributed={world_size > 1}) …",
+            flush=True,
+        )
 
     train_dl, eval_dl = build_dataloaders(
         tokenizer=tokenizer,
         seq_len=args.seq_len,
-        batch_size=args.batch_size,   # per-GPU batch size
+        batch_size=args.batch_size,
         eval_batches=args.eval_batches,
         num_workers=args.num_workers,
         rank=global_rank,
         world_size=world_size,
+        distributed=(world_size > 1),   # → OLM DataLoader(distributed=True)
     )
 
     # --- model --------------------------------------------------------------
     is_averaged = cfg.averaging_k > 1
 
     if is_main:
-        print(f"[{cfg.name}] Building OLM backbone "
-              f"d={cfg.d_model} h={cfg.n_heads} l={cfg.n_layers} …", flush=True)
+        print(
+            f"[{cfg.name}] Building OLM backbone "
+            f"d={cfg.d_model} h={cfg.n_heads} l={cfg.n_layers} …",
+            flush=True,
+        )
 
     backbone = OLMTransformerBody(
         vocab_size=len(tokenizer),
@@ -255,10 +314,8 @@ def train_model(
         method_cfg = build_method_config(f"uniform_k{cfg.averaging_k}")
         model = OLMAveragedLanguageModel(backbone, method_cfg)
     else:
-        model = backbone   # OLMTransformerBody is itself a valid nn.Module
+        model = backbone
 
-    # Gradient checkpointing: on A6000 (48 GB) the 500M model fits without it,
-    # but keep it conditional on the config flag for flexibility.
     if cfg.grad_checkpoint:
         if is_main:
             print(f"[{cfg.name}] Enabling gradient checkpointing …", flush=True)
@@ -266,17 +323,22 @@ def train_model(
 
     model.to(device)
 
-    # Wrap with DDP (only after moving to GPU)
+    # Wrap with PyTorch DDP (OLM's DDPTrainer uses this internally as well)
     ddp_model = model
     if world_size > 1:
         ddp_model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if is_main:
-        print(f"[{cfg.name}] Parameters: {n_params:,} ({n_params/1e6:.1f}M) | "
-              f"World size: {world_size} GPU(s)", flush=True)
+        print(
+            f"[{cfg.name}] Parameters: {n_params:,} ({n_params/1e6:.1f}M) | "
+            f"GPUs: {world_size} | "
+            f"Global batch: {args.batch_size} × {world_size} = "
+            f"{args.batch_size * world_size} seqs/step",
+            flush=True,
+        )
 
-    # --- optimiser + scheduler (on the underlying model, not DDP wrapper) --
+    # --- OLM AdamW + cosine-warmup scheduler --------------------------------
     total_steps = estimate_total_batches(
         cfg.target_tokens, args.seq_len, args.batch_size, world_size
     )
@@ -289,7 +351,7 @@ def train_model(
 
     # --- resume -------------------------------------------------------------
     start_step       = 0
-    tokens_seen      = 0        # global tokens across all GPUs
+    tokens_seen      = 0
     cumulative_flops = 0.0
 
     if args.resume:
@@ -306,11 +368,17 @@ def train_model(
             tokens_seen      = state["tokens_seen"]
             cumulative_flops = state["cumulative_flops"]
             if is_main:
-                print(f"[{cfg.name}] Resumed at step={start_step:,} "
-                      f"tokens={tokens_seen:,}", flush=True)
+                print(
+                    f"[{cfg.name}] Resumed: step={start_step:,} "
+                    f"tokens={tokens_seen/1e9:.2f}B",
+                    flush=True,
+                )
         elif is_main:
-            print(f"[{cfg.name}] --resume set but no checkpoint found; "
-                  f"starting from scratch.", flush=True)
+            print(
+                f"[{cfg.name}] --resume set but no checkpoint found; "
+                f"starting from scratch.",
+                flush=True,
+            )
 
     # --- CSV log (rank 0 only) ----------------------------------------------
     csv_file   = None
@@ -325,45 +393,44 @@ def train_model(
             )
             csv_file.flush()
 
-    # --- FLOPs accounting ---------------------------------------------------
-    # Per global step (all GPUs combined):
-    #   standard  : 6 · N · (batch_per_gpu · world_size) · seq_len
-    #   averaging : 6 · N · (batch_per_gpu · world_size) · (seq_len / k)
-    effective_seq       = args.seq_len / cfg.averaging_k
-    tokens_per_gpu_step = args.batch_size * args.seq_len
-    tokens_per_global_step = tokens_per_gpu_step * world_size
+    # --- FLOPs per global optimizer step ------------------------------------
+    # standard : 6·N · (batch/GPU · GPUs) · seq_len
+    # k=2 avg  : 6·N · (batch/GPU · GPUs) · (seq_len / k)
+    effective_seq          = args.seq_len / cfg.averaging_k
+    tokens_per_global_step = args.batch_size * world_size * args.seq_len
     flops_per_global_step  = (
         6.0 * n_params * args.batch_size * world_size * effective_seq
     )
 
     # --- training loop ------------------------------------------------------
     ddp_model.train()
-    step      = start_step
-    ema_loss  = None
-    ema_alpha = 0.98
+    step     = start_step
+    ema_loss = None
+    EMA_A    = 0.98
 
     train_iter = iter(train_dl)
 
     if is_main:
         print(
-            f"[{cfg.name}] Starting training: "
-            f"{total_steps:,} steps × {tokens_per_global_step:,} tokens/step "
-            f"= {cfg.target_tokens/1e9:.1f}B total tokens  "
-            f"(batch {args.batch_size}/GPU × {world_size} GPU = "
-            f"{args.batch_size * world_size} global batch)",
+            f"[{cfg.name}] Starting: {total_steps:,} steps × "
+            f"{tokens_per_global_step:,} tokens/step "
+            f"= {cfg.target_tokens/1e9:.1f}B tokens",
             flush=True,
         )
     t0 = time.time()
 
     while step < total_steps:
-        # Fetch a batch for this rank
         try:
             batch = next(train_iter)
         except StopIteration:
             train_iter = iter(train_dl)
             batch = next(train_iter)
 
-        input_ids = batch.to(device)
+        # OLM DataLoader may return dicts; handle both cases
+        if isinstance(batch, dict):
+            input_ids = batch["input_ids"].to(device)
+        else:
+            input_ids = batch.to(device)
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -387,17 +454,17 @@ def train_model(
         tokens_seen      += tokens_per_global_step
         cumulative_flops += flops_per_global_step
 
-        # Average the loss across all ranks for accurate logging
-        loss_tensor = loss.detach().clone()
-        _all_reduce_mean(loss_tensor, world_size)
-        loss_val = loss_tensor.item()
+        # Average loss across GPUs for accurate logging
+        loss_t = loss.detach().clone()
+        _all_reduce_mean(loss_t, world_size)
+        loss_val = loss_t.item()
 
         if ema_loss is None:
             ema_loss = loss_val
         else:
-            ema_loss = ema_alpha * ema_loss + (1 - ema_alpha) * loss_val
+            ema_loss = EMA_A * ema_loss + (1 - EMA_A) * loss_val
 
-        # --- logging (rank 0 only) ------------------------------------------
+        # --- logging (rank 0) -----------------------------------------------
         if is_main and step % args.log_steps == 0:
             eval_loss_val = _eval_loss(
                 model, eval_dl, device,
@@ -410,56 +477,53 @@ def train_model(
             ])
             csv_file.flush()
 
-            elapsed = time.time() - t0
-            tok_per_sec = tokens_seen / elapsed
-            pct = 100.0 * tokens_seen / cfg.target_tokens
-            eta_h = ((cfg.target_tokens - tokens_seen) / max(tok_per_sec, 1)) / 3600
+            elapsed   = time.time() - t0
+            tok_s     = tokens_seen / elapsed
+            pct       = 100.0 * tokens_seen / cfg.target_tokens
+            eta_h     = ((cfg.target_tokens - tokens_seen) / max(tok_s, 1)) / 3600
+            lr_now    = scheduler.get_last_lr()[0]
 
             print(
                 f"[{cfg.name}] step={step:>8,} | "
-                f"tokens={tokens_seen/1e9:.3f}B/{cfg.target_tokens/1e9:.0f}B "
-                f"({pct:.1f}%) | "
+                f"tokens={tokens_seen/1e9:.3f}B/{cfg.target_tokens/1e9:.0f}B ({pct:.1f}%) | "
                 f"loss={ema_loss:.4f} | eval={eval_loss_val:.4f} | "
-                f"flops={cumulative_flops:.2e} | "
-                f"tok/s={tok_per_sec:,.0f} | ETA={eta_h:.1f}h",
+                f"lr={lr_now:.2e} | flops={cumulative_flops:.2e} | "
+                f"tok/s={tok_s:,.0f} | ETA={eta_h:.1f}h",
                 flush=True,
             )
 
-        # --- checkpoint (rank 0 only) ----------------------------------------
+        # --- checkpoint (rank 0; barrier syncs all ranks) -------------------
         if is_main and step % args.checkpoint_steps == 0:
             ckpt_path = ckpt_dir / f"step_{step:08d}.pt"
             torch.save(
                 {
-                    "step":              step,
-                    "tokens_seen":       tokens_seen,
-                    "cumulative_flops":  cumulative_flops,
-                    "model":             model.state_dict(),
-                    "optimizer":         optimizer.state_dict(),
-                    "scheduler":         scheduler.state_dict(),
+                    "step":             step,
+                    "tokens_seen":      tokens_seen,
+                    "cumulative_flops": cumulative_flops,
+                    "model":            model.state_dict(),
+                    "optimizer":        optimizer.state_dict(),
+                    "scheduler":        scheduler.state_dict(),
                 },
                 ckpt_path,
             )
             print(f"[{cfg.name}] Checkpoint → {ckpt_path}", flush=True)
 
-        # Sync all ranks at checkpoint boundary to keep data streams aligned
-        if world_size > 1 and step % args.checkpoint_steps == 0:
-            dist.barrier()
+        _barrier(world_size)   # keep all ranks in step-lock
 
-    # --- final checkpoint + eval (rank 0 only) ------------------------------
+    # --- final checkpoint + eval (rank 0) -----------------------------------
     if is_main:
         final_ckpt = ckpt_dir / "final.pt"
         torch.save(
             {
-                "step":              step,
-                "tokens_seen":       tokens_seen,
-                "cumulative_flops":  cumulative_flops,
-                "model":             model.state_dict(),
-                "optimizer":         optimizer.state_dict(),
-                "scheduler":         scheduler.state_dict(),
+                "step":             step,
+                "tokens_seen":      tokens_seen,
+                "cumulative_flops": cumulative_flops,
+                "model":            model.state_dict(),
+                "optimizer":        optimizer.state_dict(),
+                "scheduler":        scheduler.state_dict(),
             },
             final_ckpt,
         )
-
         final_eval = _eval_loss(
             model, eval_dl, device,
             max_batches=args.eval_batches * 2,
@@ -474,13 +538,13 @@ def train_model(
 
         elapsed_total = time.time() - t0
         print(
-            f"[{cfg.name}] Training complete.  "
+            f"[{cfg.name}] Done.  "
             f"Final eval loss: {final_eval:.4f}.  "
             f"Total time: {elapsed_total/3600:.1f}h",
             flush=True,
         )
 
-    _cleanup_ddp(world_size)
+    _cleanup_distributed(world_size)
     return log_path
 
 
@@ -492,49 +556,36 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
             "Train one Chinchilla comparison model on FineWeb sample-10BT.\n"
-            "Launch with torchrun for multi-GPU: "
-            "torchrun --standalone --nproc_per_node=8 train.py --model model1_125m"
+            "Single-GPU:  python train.py --model model1_125m\n"
+            "8-GPU DDP:   torchrun --standalone --nproc_per_node=8 train.py --model model1_125m"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument(
-        "--model",
-        required=True,
-        choices=["model1_125m", "model2_500m", "avg_125m_k2"],
-        help="Which model config to train.",
-    )
+    p.add_argument("--model",            required=True,
+                   choices=["model1_125m", "model2_500m", "avg_125m_k2"])
     p.add_argument("--batch_size",       type=int, default=16,
-                   help="Per-GPU batch size. Global batch = batch_size × num_GPUs.")
+                   help="Per-GPU batch size.")
     p.add_argument("--seq_len",          type=int, default=1024)
     p.add_argument("--device",           type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu",
-                   help="Device for single-GPU mode. Ignored when torchrun is used.")
-    p.add_argument("--log_steps",        type=int, default=1_000,
-                   help="Log to CSV + print every N optimizer steps.")
-    p.add_argument("--checkpoint_steps", type=int, default=50_000,
-                   help="Save checkpoint every N optimizer steps.")
-    p.add_argument("--eval_batches",     type=int, default=64,
-                   help="Eval batches per evaluation pass (rank-0 only).")
-    p.add_argument("--num_workers",      type=int, default=2,
-                   help="DataLoader worker processes per rank.")
+                   help="Device for single-GPU mode. Ignored by torchrun.")
+    p.add_argument("--log_steps",        type=int, default=1_000)
+    p.add_argument("--checkpoint_steps", type=int, default=50_000)
+    p.add_argument("--eval_batches",     type=int, default=64)
+    p.add_argument("--num_workers",      type=int, default=2)
     p.add_argument("--tokenizer_name",   type=str,
                    default="EleutherAI/pythia-70m")
-    p.add_argument("--resume",           action="store_true",
-                   help="Resume from the latest checkpoint.")
-    p.add_argument("--results_dir",      type=str, default=None,
-                   help="Override results directory.")
+    p.add_argument("--resume",           action="store_true")
+    p.add_argument("--results_dir",      type=str, default=None)
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     cfg  = get_config(args.model)
-
     results_dir = Path(args.results_dir) / cfg.name if args.results_dir else None
     log_path = train_model(cfg, args, results_dir=results_dir)
-
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    if local_rank == 0:
+    if _is_main_process():
         print(f"Loss log saved to: {log_path}", flush=True)
 
 
