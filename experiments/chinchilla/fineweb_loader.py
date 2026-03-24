@@ -6,20 +6,32 @@ into fixed-length non-padded chunks of `seq_len` tokens using the Pythia
 GPT-NeoX tokenizer.  No local bulk download is needed — HuggingFace datasets
 handles streaming transparently.
 
+Multi-GPU / DDP sharding
+------------------------
+When training with torchrun across N GPUs each GPU should see a disjoint
+slice of the document stream.  Pass `rank` and `world_size` to
+`build_dataloaders`; each rank will pick up every world_size-th document
+starting from `rank`, ensuring no data duplication across GPUs.
+
 Held-out eval shard
 -------------------
 FineWeb sample-10BT only ships a "train" split.  We create a reproducible
-eval shard by skipping the first `eval_skip_docs` documents and taking the
-next `eval_docs` documents.  Training uses the remaining documents.
+eval shard by taking the first `EVAL_DOCS` documents.  Training skips those
+docs and uses the rest.
 
-Usage
------
+Usage (single-GPU)
+------------------
     from experiments.chinchilla.fineweb_loader import build_dataloaders
+    train_dl, eval_dl = build_dataloaders(tokenizer, seq_len=1024, batch_size=8)
 
-    train_dl, eval_dl = build_dataloaders(tokenizer, seq_len=1024,
-                                          batch_size=8, eval_batches=64)
-    for batch in train_dl:
-        input_ids = batch          # LongTensor [B, seq_len]
+Usage (multi-GPU — called inside torchrun worker)
+--------------------------------------------------
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    train_dl, eval_dl = build_dataloaders(
+        tokenizer, seq_len=1024, batch_size=8,
+        rank=local_rank, world_size=world_size,
+    )
 """
 
 from __future__ import annotations
@@ -43,15 +55,59 @@ if _ROOT not in sys.path:
 FINEWEB_REPO   = "HuggingFaceFW/fineweb"
 FINEWEB_SUBSET = "sample-10BT"
 
-# Number of documents reserved as a held-out eval shard.
-# These are *skipped* during training and used for eval only.
-EVAL_DOCS = 5_000          # ~50M tokens at typical FineWeb doc lengths
-EVAL_SKIP_DOCS = 0         # take first EVAL_DOCS docs for eval
+# First EVAL_DOCS documents are reserved as the held-out eval shard.
+EVAL_DOCS = 5_000   # ~50M tokens at typical FineWeb document lengths
 
 
 # ---------------------------------------------------------------------------
-# Core packing utilities
+# Core document stream helpers
 # ---------------------------------------------------------------------------
+
+def _doc_stream(
+    skip: int = 0,
+    take: Optional[int] = None,
+    rank: int = 0,
+    world_size: int = 1,
+) -> Iterator[str]:
+    """
+    Yield raw text strings from FineWeb sample-10BT.
+
+    When world_size > 1 each rank receives a disjoint interleaved slice of
+    the stream: rank r takes every world_size-th document starting at offset r
+    (after the initial `skip` documents are consumed).
+
+    Args:
+        skip       : absolute number of leading documents to skip before
+                     any sharding.  Used to exclude the eval shard.
+        take       : stop after yielding this many documents (used for eval).
+        rank       : this worker's rank (0-based)
+        world_size : total number of parallel workers
+    """
+    from datasets import load_dataset
+
+    ds = load_dataset(
+        FINEWEB_REPO,
+        name=FINEWEB_SUBSET,
+        split="train",
+        streaming=True,
+    )
+
+    yielded = 0
+    shard_idx = 0   # index within the post-skip document stream
+
+    for abs_idx, example in enumerate(ds):
+        if abs_idx < skip:
+            continue
+
+        # Shard: this rank only takes documents where shard_idx % world_size == rank
+        if shard_idx % world_size == rank:
+            yield example["text"]
+            yielded += 1
+            if take is not None and yielded >= take:
+                break
+
+        shard_idx += 1
+
 
 def _tokenize_and_pack(
     text_iter: Iterator[str],
@@ -81,67 +137,51 @@ def _tokenize_and_pack(
             yield torch.tensor(chunk, dtype=torch.long)
 
 
-def _doc_stream(split: str = "train", skip: int = 0, take: Optional[int] = None):
-    """
-    Yield raw text strings from FineWeb sample-10BT.
-
-    Args:
-        split : dataset split ("train" — the only one available)
-        skip  : number of leading documents to skip
-        take  : if not None, stop after this many documents
-    """
-    from datasets import load_dataset
-
-    ds = load_dataset(
-        FINEWEB_REPO,
-        name=FINEWEB_SUBSET,
-        split=split,
-        streaming=True,
-    )
-    count = 0
-    for i, example in enumerate(ds):
-        if i < skip:
-            continue
-        yield example["text"]
-        count += 1
-        if take is not None and count >= take:
-            break
-
-
 # ---------------------------------------------------------------------------
 # IterableDatasets
 # ---------------------------------------------------------------------------
 
 class FineWebTrainDataset(IterableDataset):
     """
-    Streaming training dataset.  Skips the first EVAL_DOCS documents (held
-    out for eval) and packs the rest into seq_len-token chunks indefinitely,
-    cycling through the stream.
+    Infinite streaming training dataset backed by FineWeb sample-10BT.
 
-    Attributes:
-        tokenizer : Pythia GPT-NeoX tokenizer
-        seq_len   : tokens per chunk (default 1024)
+    Skips the first EVAL_DOCS documents (held out for eval) and packs the
+    rest into seq_len-token chunks indefinitely, cycling through the stream.
+
+    In multi-GPU mode each rank is assigned an interleaved shard of the
+    document stream so every GPU sees different data at every step.
     """
 
-    def __init__(self, tokenizer: PreTrainedTokenizerBase, seq_len: int = 1024):
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        seq_len: int = 1024,
+        rank: int = 0,
+        world_size: int = 1,
+    ):
         super().__init__()
         self.tokenizer = tokenizer
         self.seq_len = seq_len
+        self.rank = rank
+        self.world_size = world_size
 
     def __iter__(self) -> Iterator[torch.Tensor]:
-        while True:  # cycle forever; caller stops by token count
-            for chunk in _tokenize_and_pack(
-                _doc_stream(skip=EVAL_DOCS),
+        while True:   # cycle; caller stops by token count
+            yield from _tokenize_and_pack(
+                _doc_stream(
+                    skip=EVAL_DOCS,
+                    rank=self.rank,
+                    world_size=self.world_size,
+                ),
                 self.tokenizer,
                 self.seq_len,
-            ):
-                yield chunk
+            )
 
 
 class FineWebEvalDataset(IterableDataset):
     """
-    Fixed eval shard: the first EVAL_DOCS documents of FineWeb, packed into
-    seq_len-token chunks.  Iterating twice gives the same chunks each time.
+    Fixed eval shard: the first EVAL_DOCS documents, packed into seq_len chunks.
+    All ranks read the same eval shard (evaluation is rank-0-only in train.py).
     """
 
     def __init__(self, tokenizer: PreTrainedTokenizerBase, seq_len: int = 1024):
@@ -151,7 +191,7 @@ class FineWebEvalDataset(IterableDataset):
 
     def __iter__(self) -> Iterator[torch.Tensor]:
         yield from _tokenize_and_pack(
-            _doc_stream(skip=EVAL_SKIP_DOCS, take=EVAL_DOCS),
+            _doc_stream(skip=0, take=EVAL_DOCS, rank=0, world_size=1),
             self.tokenizer,
             self.seq_len,
         )
@@ -167,25 +207,29 @@ def build_dataloaders(
     batch_size: int = 8,
     eval_batches: int = 64,
     num_workers: int = 0,
+    rank: int = 0,
+    world_size: int = 1,
 ):
     """
     Build (train_dataloader, eval_dataloader) for FineWeb sample-10BT.
 
-    The train dataloader cycles indefinitely; stop training by token count,
-    not by epoch.  The eval dataloader is finite (eval_batches × batch_size
-    sequences drawn from the fixed eval shard).
+    The train dataloader cycles indefinitely; stop training by token count.
+    The eval dataloader is finite (eval_batches × batch_size sequences drawn
+    from the fixed eval shard).
 
     Args:
         tokenizer    : Pythia GPT-NeoX tokenizer
         seq_len      : tokens per sequence (default 1024)
-        batch_size   : sequences per batch
+        batch_size   : sequences per batch *per GPU*
         eval_batches : number of batches used for each eval pass
         num_workers  : DataLoader worker processes (0 = main process only)
+        rank         : this process's rank (0 for single-GPU)
+        world_size   : total number of parallel processes (1 for single-GPU)
 
     Returns:
         (train_dl, eval_dl)
     """
-    train_ds = FineWebTrainDataset(tokenizer, seq_len)
+    train_ds = FineWebTrainDataset(tokenizer, seq_len, rank=rank, world_size=world_size)
     eval_ds  = FineWebEvalDataset(tokenizer, seq_len)
 
     train_dl = DataLoader(
@@ -204,7 +248,17 @@ def build_dataloaders(
     return train_dl, eval_dl
 
 
-def estimate_total_batches(target_tokens: int, seq_len: int, batch_size: int) -> int:
-    """Return the number of training steps needed to consume `target_tokens`."""
-    tokens_per_step = batch_size * seq_len
-    return (target_tokens + tokens_per_step - 1) // tokens_per_step
+def estimate_total_batches(
+    target_tokens: int,
+    seq_len: int,
+    batch_size: int,
+    world_size: int = 1,
+) -> int:
+    """
+    Return the number of optimizer steps needed to consume `target_tokens`
+    across all GPUs combined.
+
+    Each step processes `batch_size * world_size * seq_len` tokens globally.
+    """
+    tokens_per_global_step = batch_size * world_size * seq_len
+    return (target_tokens + tokens_per_global_step - 1) // tokens_per_global_step
