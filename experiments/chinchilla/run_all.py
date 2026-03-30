@@ -9,7 +9,17 @@ resuming interrupted training runs.
   8× A6000 recommended launch commands
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Full sequential run (all 3 models, ~19 h total):
+Step 0 — pre-download tokenizer ONCE before torchrun (prevents 8-process
+          lock-file race on first launch):
+
+    python -c "from transformers import AutoTokenizer; \
+               AutoTokenizer.from_pretrained('EleutherAI/pythia-70m')"
+
+Step 1 — fix NumPy ABI mismatch (NumPy 2.x installed, PyTorch 1.12 needs 1.x):
+
+    pip install "numpy<2"
+
+Step 2 — full sequential run (all 3 models, ~19 h total):
 
     nohup torchrun --standalone --nproc_per_node=8 \
         experiments/chinchilla/run_all.py \

@@ -69,6 +69,12 @@ import torch.distributed as _dist   # aliased to avoid name clash with 'dist'
 def _setup_distributed() -> tuple:
     """
     Initialise NCCL process group when torchrun sets LOCAL_RANK.
+
+    Guards against double-init: PyTorch 1.12 raises an error if
+    init_process_group() is called a second time in the same process.
+    When training multiple models sequentially (run_all.py), this function
+    is called once per model but the process group is only initialised once.
+
     Returns (local_rank, global_rank, world_size).
     """
     local_rank  = int(os.environ.get("LOCAL_RANK",  0))
@@ -76,15 +82,19 @@ def _setup_distributed() -> tuple:
     world_size  = int(os.environ.get("WORLD_SIZE",  1))
 
     if world_size > 1:
-        _dist.init_process_group(backend="nccl")
+        if not _dist.is_initialized():
+            _dist.init_process_group(backend="nccl")
+        # set_device is idempotent — safe to call every time
         torch.cuda.set_device(local_rank)
 
     return local_rank, global_rank, world_size
 
 
 def _cleanup_distributed(world_size: int) -> None:
-    if world_size > 1 and _dist.is_initialized():
-        _dist.destroy_process_group()
+    # Do NOT destroy the process group between sequential model runs —
+    # PyTorch 1.12 cannot re-initialise it after destruction.
+    # torchrun handles cleanup automatically when the process exits.
+    pass
 
 
 def _is_main_process() -> bool:
@@ -230,7 +240,16 @@ def train_model(
     log_path = results_dir / "loss_log.csv"
 
     # --- tokenizer ----------------------------------------------------------
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=True)
+    # Rank 0 downloads first; others wait and then load from the local cache.
+    # This prevents 8 processes racing to write the same cache files and
+    # triggering a PermissionError / lock-file conflict.
+    if is_main:
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=True)
+    _barrier(world_size)   # all non-zero ranks wait until rank-0 has finished
+    if not is_main:
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.tokenizer_name, use_fast=True, local_files_only=True
+        )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
