@@ -85,6 +85,22 @@ import sys
 import time
 from pathlib import Path
 
+# ── Set HF cache dir BEFORE any HuggingFace import ───────────────────────────
+# datasets/transformers read HF_HOME & friends at *import time*, so the env
+# vars must be present before "from transformers import ..." is executed.
+# We do a quick scan of sys.argv here; proper argparse runs later.
+def _early_set_cache_dir() -> None:
+    for i, arg in enumerate(sys.argv):
+        if arg == "--cache_dir" and i + 1 < len(sys.argv):
+            cp = os.path.abspath(sys.argv[i + 1])
+            os.environ.setdefault("HF_HOME",            cp)
+            os.environ.setdefault("HF_DATASETS_CACHE",  os.path.join(cp, "datasets"))
+            os.environ.setdefault("TRANSFORMERS_CACHE",  os.path.join(cp, "hub"))
+            break
+
+_early_set_cache_dir()
+# ─────────────────────────────────────────────────────────────────────────────
+
 _ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))

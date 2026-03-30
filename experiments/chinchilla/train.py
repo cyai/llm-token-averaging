@@ -39,6 +39,21 @@ import time
 from pathlib import Path
 from typing import Optional
 
+# ── Set HF cache dir BEFORE any HuggingFace import ───────────────────────────
+# datasets/transformers read HF_HOME & friends at *import time*.  We scan
+# sys.argv here so the env vars are present before "from transformers import".
+def _early_set_cache_dir() -> None:
+    for i, arg in enumerate(sys.argv):
+        if arg == "--cache_dir" and i + 1 < len(sys.argv):
+            cp = os.path.abspath(sys.argv[i + 1])
+            os.environ.setdefault("HF_HOME",            cp)
+            os.environ.setdefault("HF_DATASETS_CACHE",  os.path.join(cp, "datasets"))
+            os.environ.setdefault("TRANSFORMERS_CACHE",  os.path.join(cp, "hub"))
+            break
+
+_early_set_cache_dir()
+# ─────────────────────────────────────────────────────────────────────────────
+
 import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
