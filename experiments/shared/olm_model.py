@@ -101,9 +101,16 @@ class OLMTransformerBody(nn.Module):
 
         # Middle children: transformer body (may be a single Repeat or several Blocks)
         if len(children) == 3:
-            self.body: nn.Module = children[1]
+            body_raw = children[1]
         else:
-            self.body = nn.Sequential(*children[1:-1])
+            body_raw = nn.Sequential(*children[1:-1])
+
+        # OLM sometimes wraps transformer layers in a ModuleList, which has no
+        # forward() method.  Normalise to Sequential so it is always callable.
+        if isinstance(body_raw, nn.ModuleList):
+            body_raw = nn.Sequential(*body_raw)
+
+        self.body: nn.Module = body_raw
 
         # Last child: output head (logit projection)
         self.embed_out: nn.Module = children[-1]

@@ -125,12 +125,12 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         d_model=768,
         n_heads=12,
         n_layers=12,
-        context_len=2048,
+        context_len=2048,       # 2× context vs model1_125m; same params
         averaging_k=1,
-        grad_checkpoint=True,   # required to fit in 24 GB VRAM
+        grad_checkpoint=True,   # attention is O(n²) at seq=2048; checkpoint to save memory
         color="#f78166",        # coral
-        label="500M standard",
-        lr=1e-4,                # lower lr for larger model
+        label="125M 2× context",
+        lr=3e-4,
         warmup_steps=2_000,
     ),
     "avg_125m_k2": ModelConfig(

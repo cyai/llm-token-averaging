@@ -249,6 +249,12 @@ def main() -> None:
                     flush=True,
                 )
             failed.append(model_name)
+        finally:
+            # Free GPU memory before loading the next model
+            import torch, gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             continue   # keep going — train remaining models
 
         # --- intermediate visualization (rank 0, after each model) ----------

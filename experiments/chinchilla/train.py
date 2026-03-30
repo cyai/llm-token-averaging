@@ -52,6 +52,10 @@ def _early_set_cache_dir() -> None:
             break
 
 _early_set_cache_dir()
+
+# Reduce CUDA allocator fragmentation — helps when large activation tensors
+# leave many small free gaps.  Set before any CUDA call.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
 # ─────────────────────────────────────────────────────────────────────────────
 
 import torch
@@ -190,18 +194,37 @@ def _build_optimizer(model: nn.Module, lr: float, weight_decay: float = 0.1):
 
 
 def _enable_gradient_checkpointing(backbone: OLMTransformerBody) -> None:
-    """Wrap each child of the transformer body with torch gradient checkpointing."""
+    """Wrap each transformer layer in the body with gradient checkpointing."""
     body = backbone.body
+
+    # HuggingFace-style convenience method (not present in plain OLM blocks)
     if hasattr(body, "gradient_checkpointing_enable"):
         body.gradient_checkpointing_enable()
         return
-    children = list(body.children())
-    if children:
-        def _ckpt_forward(x: torch.Tensor) -> torch.Tensor:
-            for m in children:
-                x = gradient_checkpoint(m, x, use_reentrant=False)
-            return x
-        body.forward = _ckpt_forward
+
+    # Flatten one level: Sequential / ModuleList → list of leaf modules
+    def _leaf_modules(m: nn.Module):
+        children = list(m.children())
+        if not children:
+            return [m]
+        # ModuleList has no forward; treat its children as the iterable units
+        if isinstance(m, (nn.ModuleList, nn.Sequential)):
+            result = []
+            for child in children:
+                result.extend(_leaf_modules(child))
+            return result
+        return [m]
+
+    layers = _leaf_modules(body)
+    if not layers:
+        return
+
+    def _ckpt_forward(x: torch.Tensor) -> torch.Tensor:
+        for layer in layers:
+            x = gradient_checkpoint(layer, x, use_reentrant=False)
+        return x
+
+    body.forward = _ckpt_forward
 
 
 # ---------------------------------------------------------------------------
@@ -604,7 +627,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--model",            required=True,
                    choices=["model1_125m", "model2_500m", "avg_125m_k2"])
-    p.add_argument("--batch_size",       type=int, default=16,
+    p.add_argument("--batch_size",       type=int, default=8,
                    help="Per-GPU batch size.")
     p.add_argument("--seq_len",          type=int, default=1024)
     p.add_argument("--device",           type=str,
