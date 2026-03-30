@@ -49,6 +49,25 @@ _ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+
+def _apply_cache_dir(cache_dir: Optional[str]) -> None:
+    """
+    Redirect all HuggingFace / datasets cache to `cache_dir` instead of
+    the default ~/.cache/huggingface.  Must be called before any HF import
+    that triggers a download (tokenizer, datasets, etc.).
+
+    Affected environment variables:
+        HF_HOME              — root for all HF artefacts (models, datasets, etc.)
+        HF_DATASETS_CACHE    — explicit override for the datasets library
+        TRANSFORMERS_CACHE   — legacy transformers cache variable
+    """
+    if not cache_dir:
+        return
+    cache_path = str(Path(cache_dir).resolve())
+    os.environ["HF_HOME"]           = cache_path
+    os.environ["HF_DATASETS_CACHE"] = str(Path(cache_path) / "datasets")
+    os.environ["TRANSFORMERS_CACHE"] = str(Path(cache_path) / "hub")
+
 from experiments.chinchilla.fineweb_loader import build_dataloaders, estimate_total_batches
 from experiments.chinchilla.model_configs import get_config, ModelConfig
 from experiments.shared.olm_model import OLMTransformerBody, OLMAveragedLanguageModel
@@ -240,15 +259,21 @@ def train_model(
     log_path = results_dir / "loss_log.csv"
 
     # --- tokenizer ----------------------------------------------------------
-    # Rank 0 downloads first; others wait and then load from the local cache.
-    # This prevents 8 processes racing to write the same cache files and
-    # triggering a PermissionError / lock-file conflict.
+    # Apply local cache dir before any HF download happens.
+    # Rank 0 downloads first; others wait then load from the now-populated
+    # local cache — prevents 8-process lock-file races.
+    _apply_cache_dir(getattr(args, "cache_dir", None))
+    cache_kwargs = dict(cache_dir=args.cache_dir) if getattr(args, "cache_dir", None) else {}
+
     if is_main:
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=True)
-    _barrier(world_size)   # all non-zero ranks wait until rank-0 has finished
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.tokenizer_name, use_fast=True, **cache_kwargs
+        )
+    _barrier(world_size)   # non-zero ranks wait until rank-0 has finished
     if not is_main:
         tokenizer = AutoTokenizer.from_pretrained(
-            args.tokenizer_name, use_fast=True, local_files_only=True
+            args.tokenizer_name, use_fast=True,
+            local_files_only=True, **cache_kwargs
         )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -269,7 +294,8 @@ def train_model(
         num_workers=args.num_workers,
         rank=global_rank,
         world_size=world_size,
-        distributed=(world_size > 1),   # → OLM DataLoader(distributed=True)
+        distributed=(world_size > 1),
+        cache_dir=getattr(args, "cache_dir", None),
     )
 
     # --- model --------------------------------------------------------------
@@ -557,6 +583,10 @@ def parse_args() -> argparse.Namespace:
                    default="EleutherAI/pythia-70m")
     p.add_argument("--resume",           action="store_true")
     p.add_argument("--results_dir",      type=str, default=None)
+    p.add_argument("--cache_dir",        type=str, default=None,
+                   help="Local directory for HuggingFace model/dataset cache "
+                        "(overrides ~/.cache/huggingface). "
+                        "Example: --cache_dir ./hf_cache")
     return p.parse_args()
 
 

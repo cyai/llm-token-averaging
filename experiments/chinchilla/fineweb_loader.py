@@ -60,11 +60,21 @@ def _doc_stream(
     take: Optional[int] = None,
     rank: int = 0,
     world_size: int = 1,
+    cache_dir: Optional[str] = None,
 ) -> Iterator[str]:
     """Yield raw text strings from FineWeb, sharded across world_size workers."""
     from datasets import load_dataset
 
-    ds = load_dataset(FINEWEB_REPO, name=FINEWEB_SUBSET, split="train", streaming=True)
+    load_kwargs = dict(
+        path=FINEWEB_REPO,
+        name=FINEWEB_SUBSET,
+        split="train",
+        streaming=True,
+    )
+    if cache_dir:
+        load_kwargs["cache_dir"] = cache_dir
+
+    ds = load_dataset(**load_kwargs)
     yielded  = 0
     shard_i  = 0
     for abs_i, example in enumerate(ds):
@@ -97,30 +107,34 @@ def _tokenize_and_pack(
 
 
 class _FallbackTrainDataset(IterableDataset):
-    def __init__(self, tokenizer, seq_len, rank=0, world_size=1):
+    def __init__(self, tokenizer, seq_len, rank=0, world_size=1, cache_dir=None):
         super().__init__()
         self.tokenizer  = tokenizer
         self.seq_len    = seq_len
         self.rank       = rank
         self.world_size = world_size
+        self.cache_dir  = cache_dir
 
     def __iter__(self):
         while True:
             yield from _tokenize_and_pack(
-                _doc_stream(skip=EVAL_DOCS, rank=self.rank, world_size=self.world_size),
+                _doc_stream(skip=EVAL_DOCS, rank=self.rank,
+                            world_size=self.world_size, cache_dir=self.cache_dir),
                 self.tokenizer, self.seq_len,
             )
 
 
 class _FallbackEvalDataset(IterableDataset):
-    def __init__(self, tokenizer, seq_len):
+    def __init__(self, tokenizer, seq_len, cache_dir=None):
         super().__init__()
         self.tokenizer = tokenizer
         self.seq_len   = seq_len
+        self.cache_dir = cache_dir
 
     def __iter__(self):
         yield from _tokenize_and_pack(
-            _doc_stream(skip=0, take=EVAL_DOCS, rank=0, world_size=1),
+            _doc_stream(skip=0, take=EVAL_DOCS, rank=0, world_size=1,
+                        cache_dir=self.cache_dir),
             self.tokenizer, self.seq_len,
         )
 
@@ -136,6 +150,7 @@ def _build_olm_dataloaders(
     eval_batches: int,
     num_workers: int,
     distributed: bool,
+    cache_dir: Optional[str] = None,
 ):
     """
     Build train + eval loaders using OLM's HuggingFaceTextDataset and
@@ -150,6 +165,10 @@ def _build_olm_dataloaders(
 
     # Training dataset — FineWeb sample-10BT, skipping the eval shard
     # OLM's HuggingFaceTextDataset handles streaming + tokenization + packing.
+    olm_kwargs = {}
+    if cache_dir:
+        olm_kwargs["cache_dir"] = cache_dir
+
     train_ds = HuggingFaceTextDataset(
         repo_id=FINEWEB_REPO,
         name=FINEWEB_SUBSET,
@@ -157,10 +176,10 @@ def _build_olm_dataloaders(
         context_length=seq_len,
         streaming=True,
         shuffle=True,
-        skip=EVAL_DOCS,        # skip the held-out eval shard
+        skip=EVAL_DOCS,
+        **olm_kwargs,
     )
 
-    # Eval shard — first EVAL_DOCS documents, no shuffle
     eval_ds = HuggingFaceTextDataset(
         repo_id=FINEWEB_REPO,
         name=FINEWEB_SUBSET,
@@ -168,7 +187,8 @@ def _build_olm_dataloaders(
         context_length=seq_len,
         streaming=True,
         shuffle=False,
-        take=EVAL_DOCS,        # only the first EVAL_DOCS docs
+        take=EVAL_DOCS,
+        **olm_kwargs,
     )
 
     # OLM's DataLoader:
@@ -203,13 +223,13 @@ def build_dataloaders(
     rank: int = 0,
     world_size: int = 1,
     distributed: bool = False,
+    cache_dir: Optional[str] = None,
 ):
     """
     Build (train_dataloader, eval_dataloader) for FineWeb sample-10BT.
 
     Prefers OLM's native HuggingFaceTextDataset + DataLoader(distributed=True).
-    Falls back to the hand-rolled streaming loader if OLM is not available or
-    if its API does not accept the required arguments.
+    Falls back to the hand-rolled streaming loader if OLM is not available.
 
     Args:
         tokenizer    : Pythia GPT-NeoX tokenizer
@@ -220,6 +240,8 @@ def build_dataloaders(
         rank         : this process's rank (for fallback sharding)
         world_size   : total number of processes (for fallback sharding)
         distributed  : enable distributed sampling (True when using torchrun)
+        cache_dir    : local directory for HuggingFace dataset cache;
+                       overrides ~/.cache/huggingface when set
 
     Returns:
         (train_dl, eval_dl)
@@ -233,6 +255,7 @@ def build_dataloaders(
             eval_batches=eval_batches,
             num_workers=num_workers,
             distributed=distributed,
+            cache_dir=cache_dir,
         )
         if rank == 0:
             print("[fineweb_loader] Using OLM HuggingFaceTextDataset + "
@@ -246,8 +269,9 @@ def build_dataloaders(
     # --- Fallback: hand-rolled streaming loader -----------------------------
     from torch.utils.data import DataLoader
 
-    train_ds = _FallbackTrainDataset(tokenizer, seq_len, rank=rank, world_size=world_size)
-    eval_ds  = _FallbackEvalDataset(tokenizer, seq_len)
+    train_ds = _FallbackTrainDataset(tokenizer, seq_len, rank=rank,
+                                     world_size=world_size, cache_dir=cache_dir)
+    eval_ds  = _FallbackEvalDataset(tokenizer, seq_len, cache_dir=cache_dir)
 
     train_dl = DataLoader(train_ds, batch_size=batch_size,
                           num_workers=num_workers, pin_memory=True)

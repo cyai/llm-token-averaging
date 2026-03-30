@@ -145,6 +145,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--plots_dir",   type=str,
                    default=str(_ROOT / "experiments" / "chinchilla" / "plots"),
                    help="Output directory for generated plots.")
+    p.add_argument("--cache_dir",   type=str, default=None,
+                   help="Local directory for HuggingFace model/dataset cache "
+                        "(overrides ~/.cache/huggingface). "
+                        "Example: --cache_dir ./hf_cache")
 
     return p.parse_args()
 
@@ -206,6 +210,7 @@ def main() -> None:
             tokenizer_name   = args.tokenizer_name,
             resume           = args.resume,
             results_dir      = str(results_dir),
+            cache_dir        = args.cache_dir,
         )
 
         model_start = time.time()
