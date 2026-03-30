@@ -122,10 +122,10 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
     ),
     "model2_500m": ModelConfig(
         name="model2_500m",
-        d_model=1024,
-        n_heads=16,
-        n_layers=36,
-        context_len=1024,
+        d_model=768,
+        n_heads=12,
+        n_layers=12,
+        context_len=2048,
         averaging_k=1,
         grad_checkpoint=True,   # required to fit in 24 GB VRAM
         color="#f78166",        # coral
