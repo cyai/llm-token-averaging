@@ -1,19 +1,13 @@
 """
 Unified training script for the Chinchilla FLOPs comparison experiment.
 
-Uses OLM's distributed training utilities for multi-GPU DDP:
-  olm.core.dist.setup_distributed()   — init NCCL process group
-  olm.core.dist.get_local_rank()      — local GPU index for this process
-  olm.core.dist.get_rank()            — global rank
-  olm.core.dist.get_world_size()      — total number of GPUs
-  olm.core.dist.is_main_process()     — True only on rank 0
+Uses OLM for model architecture (OLMTransformerBody) and optimizer (AdamW).
+Multi-GPU DDP is handled via raw torch.distributed (NCCL) for compatibility
+with PyTorch 1.12 — OLM's olm.core.dist module requires PyTorch >= 2.4.
 
-See: https://github.com/openlanguagemodel/openlanguagemodel/blob/main/docs/datasets-and-training.md
-
-The training loop itself is kept custom because OLM's DDPTrainer does not
-support the averaged-LM forward interface (OLMAveragedLanguageModel) or the
-FLOPs-accounting / CSV logging we need.  However all distributed plumbing
-delegates to OLM's dist module.
+The training loop is custom because OLM's DDPTrainer does not support the
+averaged-LM forward interface (OLMAveragedLanguageModel) or the per-step
+FLOPs accounting and CSV logging required by this experiment.
 
 Single-GPU
 ----------
@@ -62,85 +56,52 @@ from experiments.shared.averaged_lm import build_method_config
 
 
 # ---------------------------------------------------------------------------
-# OLM distributed utilities  (with graceful fallback to raw torch.distributed)
+# Distributed utilities  (raw torch.distributed — works with PyTorch 1.12+)
+#
+# OLM's olm.core.dist module calls torch.distributed.Work which was added
+# in PyTorch 2.x.  We therefore use torch.distributed directly so the
+# script works on older clusters (e.g. CUDA 11.3 / PyTorch 1.12).
 # ---------------------------------------------------------------------------
 
-def _setup_distributed() -> tuple[int, int, int]:
-    """
-    Initialise the distributed process group using OLM's setup_distributed(),
-    falling back to raw torch.distributed if OLM is not available.
+import torch.distributed as _dist   # aliased to avoid name clash with 'dist'
 
-    Returns:
-        (local_rank, global_rank, world_size)
+
+def _setup_distributed() -> tuple:
+    """
+    Initialise NCCL process group when torchrun sets LOCAL_RANK.
+    Returns (local_rank, global_rank, world_size).
     """
     local_rank  = int(os.environ.get("LOCAL_RANK",  0))
     global_rank = int(os.environ.get("RANK",        0))
     world_size  = int(os.environ.get("WORLD_SIZE",  1))
 
-    if world_size == 1:
-        return local_rank, global_rank, world_size
+    if world_size > 1:
+        _dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
 
-    try:
-        # OLM-native distributed init (auto-detects NCCL for GPU, Gloo for CPU)
-        from olm.core.dist import setup_distributed
-        setup_distributed()
-    except ImportError:
-        import torch.distributed as dist
-        dist.init_process_group(backend="nccl")
-
-    torch.cuda.set_device(local_rank)
     return local_rank, global_rank, world_size
 
 
 def _cleanup_distributed(world_size: int) -> None:
-    if world_size <= 1:
-        return
-    try:
-        from olm.core.dist import cleanup_distributed
-        cleanup_distributed()
-    except (ImportError, AttributeError):
-        import torch.distributed as dist
-        if dist.is_initialized():
-            dist.destroy_process_group()
-
-
-def _get_rank() -> int:
-    try:
-        from olm.core.dist import get_rank
-        return get_rank()
-    except ImportError:
-        return int(os.environ.get("RANK", 0))
-
-
-def _get_world_size() -> int:
-    try:
-        from olm.core.dist import get_world_size
-        return get_world_size()
-    except ImportError:
-        return int(os.environ.get("WORLD_SIZE", 1))
+    if world_size > 1 and _dist.is_initialized():
+        _dist.destroy_process_group()
 
 
 def _is_main_process() -> bool:
-    try:
-        from olm.core.dist import is_main_process
-        return is_main_process()
-    except ImportError:
-        return int(os.environ.get("RANK", 0)) == 0
+    return int(os.environ.get("RANK", 0)) == 0
 
 
 def _all_reduce_mean(tensor: torch.Tensor, world_size: int) -> torch.Tensor:
-    """Average a scalar tensor across all ranks."""
+    """Sum tensor across all ranks then divide by world_size."""
     if world_size > 1:
-        import torch.distributed as dist
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        _dist.all_reduce(tensor, op=_dist.ReduceOp.SUM)
         tensor /= world_size
     return tensor
 
 
 def _barrier(world_size: int) -> None:
     if world_size > 1:
-        import torch.distributed as dist
-        dist.barrier()
+        _dist.barrier()
 
 
 # ---------------------------------------------------------------------------

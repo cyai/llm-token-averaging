@@ -356,17 +356,15 @@ def plot_plotly(
             font=dict(size=18, color="#e6edf3"),
         ),
         xaxis=dict(
-            title="Cumulative FLOPs",
+            title=dict(text="Cumulative FLOPs", font=dict(color="#c9d1d9")),
             type="log",
             gridcolor="#21262d",
             tickfont=dict(color="#c9d1d9"),
-            titlefont=dict(color="#c9d1d9"),
         ),
         yaxis=dict(
-            title="Cross-Entropy Loss",
+            title=dict(text="Cross-Entropy Loss", font=dict(color="#c9d1d9")),
             gridcolor="#21262d",
             tickfont=dict(color="#c9d1d9"),
-            titlefont=dict(color="#c9d1d9"),
         ),
         legend=dict(
             bgcolor="#161b22",
