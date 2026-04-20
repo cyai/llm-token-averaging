@@ -2,28 +2,28 @@
 Model configuration registry for the Chinchilla FLOPs comparison experiment.
 
 Three models are compared:
-  model1_125m  — 124M-parameter OLM transformer, no averaging (standard LM)
-  model2_500m  — 504M-parameter OLM transformer, no averaging (larger standard LM)
-  avg_125m_k2  — 124M-parameter OLM transformer + 2x uniform token averaging
+  model1_125m  — 124M params, context=1024, no averaging       (baseline)
+  model2_500m  — 504M params, context=2048, no averaging       (bigger model + 2× context)
+  avg_125m_k2  — 124M params, context=1024, k=2 averaging     (effective 2× context via compression)
 
-All three share the same OLM architecture style (same block type, attention,
-FFN, positional encoding).  model1_125m and avg_125m_k2 have an identical
-backbone — the only difference is the OLMAveragedLanguageModel(k=2) wrapper.
+The key research question: can a small model with token averaging match the
+quality of a 4× larger model trained with a genuine 2× context window, at a
+fraction of the FLOPs?
 
 Parameter estimates
 -------------------
   N ≈ vocab_size × d_model  +  n_layers × 12 × d_model²
 
-  model1_125m : 50257 × 768  +  12 × 12 × 768²  = 38.6M + 85.2M ≈ 124M
-  model2_500m : 50257 × 1024 + 36 × 12 × 1024²  = 51.5M + 452.9M ≈ 504M
+  model1_125m : 50257 × 768  + 12 × 12 × 768²   = 38.6M +  85.0M ≈ 124M
+  model2_500m : 50257 × 1024 + 36 × 12 × 1024²  = 51.5M + 453.0M ≈ 504M
   avg_125m_k2 : same backbone as model1_125m ≈ 124M
 
-Compute on g5.2xlarge (A10G, ~125 TFLOPS BF16, ~50% efficiency → 62 TFLOPS eff.)
------------------------------------------------------------------------------------
-  model1_125m  : C = 6 × 124M × 10B = 7.44 × 10¹⁸ FLOPs  ≈ 2.3 days
-  model2_500m  : C = 6 × 504M × 10B = 3.02 × 10¹⁹ FLOPs  ≈ 9.3 days
-  avg_125m_k2  : C = 6 × 124M × 5B  = 3.72 × 10¹⁸ FLOPs  ≈ 1.2 days
-  Total sequential                                          ≈ 13 days
+FLOPs estimates on 8× A6000 (~155 TFLOPS BF16 × 8, ~50% MFU → 620 TFLOPS eff.)
+----------------------------------------------------------------------------------
+  model1_125m  : C = 6 × 124M × 10B  = 7.44 × 10¹⁸ FLOPs  ≈   3.3 h
+  avg_125m_k2  : C = 6 × 124M × 5B   = 3.72 × 10¹⁸ FLOPs  ≈   1.7 h  (k=2 halves transformer tokens)
+  model2_500m  : C = 6 × 504M × 10B  = 3.02 × 10¹⁹ FLOPs  ≈  13.5 h
+  Total sequential                                           ≈  18.5 h
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from typing import Dict
 # ModelConfig dataclass
 # ---------------------------------------------------------------------------
 
-TARGET_TOKENS = 10_000_000_000   # 10B tokens for every model
+TARGET_TOKENS = 10_000_000_000  # 10B tokens for every model
 
 
 @dataclass
@@ -45,8 +45,9 @@ class ModelConfig:
     # Identifier used in directory names, CSV columns, and plot labels
     name: str
 
-    # OLMTransformerBody architecture hyperparameters (same across all three models
-    # in spirit — model2_500m is scaled up but uses identical OLM block style)
+    # OLMTransformerBody architecture hyperparameters.
+    # model1_125m / avg_125m_k2 share d=768/h=12/l=12/ctx=1024.
+    # model2_500m uses d=1024/h=16/l=36/ctx=2048 for ~504M params + 2× context.
     d_model: int
     n_heads: int
     n_layers: int
@@ -79,8 +80,8 @@ class ModelConfig:
     @property
     def n_params_approx(self) -> int:
         """Rough parameter count (embedding + transformer layers)."""
-        vocab = 50_257   # Pythia GPT-NeoX BPE
-        return vocab * self.d_model + self.n_layers * 12 * self.d_model ** 2
+        vocab = 50_257  # Pythia GPT-NeoX BPE
+        return vocab * self.d_model + self.n_layers * 12 * self.d_model**2
 
     @property
     def flops_per_token(self) -> float:
@@ -115,7 +116,7 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         context_len=1024,
         averaging_k=1,
         grad_checkpoint=False,
-        color="#58a6ff",      # blue
+        color="#58a6ff",  # blue
         label="125M standard",
         lr=3e-4,
         warmup_steps=2_000,
@@ -125,11 +126,11 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         d_model=1024,
         n_heads=16,
         n_layers=36,
-        context_len=1024,
+        context_len=2048,       # 2× context vs model1_125m
         averaging_k=1,
-        grad_checkpoint=True,   # required to fit in 24 GB VRAM
+        grad_checkpoint=True,   # 504M params + seq=2048 requires checkpointing on A6000
         color="#f78166",        # coral
-        label="500M standard",
+        label="500M 2× context",
         lr=1e-4,                # lower lr for larger model
         warmup_steps=2_000,
     ),
@@ -141,7 +142,7 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         context_len=1024,
         averaging_k=2,
         grad_checkpoint=False,
-        color="#3fb950",        # green
+        color="#3fb950",  # green
         label="125M + 2× averaging",
         lr=3e-4,
         warmup_steps=2_000,
@@ -162,8 +163,10 @@ def get_config(name: str) -> ModelConfig:
 
 def print_summary() -> None:
     """Print a summary table of all three model configs."""
-    header = f"{'Model':<20} {'d_model':>8} {'heads':>6} {'layers':>7} " \
-             f"{'~Params':>10} {'FLOPs/tok':>12} {'Total FLOPs':>14} {'avg_k':>6}"
+    header = (
+        f"{'Model':<20} {'d_model':>8} {'heads':>6} {'layers':>7} "
+        f"{'~Params':>10} {'FLOPs/tok':>12} {'Total FLOPs':>14} {'avg_k':>6}"
+    )
     print(header)
     print("-" * len(header))
     for cfg in MODEL_CONFIGS.values():
