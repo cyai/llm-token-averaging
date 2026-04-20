@@ -80,28 +80,20 @@ def _setup_distributed() -> tuple[int, int, int]:
     if world_size == 1:
         return local_rank, global_rank, world_size
 
-    try:
-        # OLM-native distributed init (auto-detects NCCL for GPU, Gloo for CPU)
-        from olm.core.dist import setup_distributed
-        setup_distributed()
-    except ImportError:
-        import torch.distributed as dist
-        dist.init_process_group(backend="nccl")
+    # Use raw torch.distributed directly — OLM's setup_distributed calls
+    # torch.distributed.timedelta which does not exist in any PyTorch version
+    # (the correct call is datetime.timedelta).  Bypass OLM entirely.
+    import torch.distributed as _dist
+    if not _dist.is_initialized():
+        _dist.init_process_group(backend="nccl")
 
     torch.cuda.set_device(local_rank)
     return local_rank, global_rank, world_size
 
 
 def _cleanup_distributed(world_size: int) -> None:
-    if world_size <= 1:
-        return
-    try:
-        from olm.core.dist import cleanup_distributed
-        cleanup_distributed()
-    except (ImportError, AttributeError):
-        import torch.distributed as dist
-        if dist.is_initialized():
-            dist.destroy_process_group()
+    # torchrun handles process group teardown; nothing to do here.
+    pass
 
 
 def _get_rank() -> int:
