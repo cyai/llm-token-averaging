@@ -564,7 +564,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log_steps",        type=int, default=1_000)
     p.add_argument("--checkpoint_steps", type=int, default=50_000)
     p.add_argument("--eval_batches",     type=int, default=64)
-    p.add_argument("--num_workers",      type=int, default=2)
+    p.add_argument("--num_workers",      type=int, default=0,
+                   help="DataLoader workers per rank. Keep 0 for streaming "
+                        "datasets to avoid HF API rate-limit (16 workers × "
+                        "8 GPUs = too many simultaneous connections).")
     p.add_argument("--tokenizer_name",   type=str,
                    default="EleutherAI/pythia-70m")
     p.add_argument("--resume",           action="store_true")
