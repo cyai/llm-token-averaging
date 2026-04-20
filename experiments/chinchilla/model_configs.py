@@ -2,28 +2,26 @@
 Model configuration registry for the Chinchilla FLOPs comparison experiment.
 
 Three models are compared:
-  model1_125m  — 124M params, context=1024, no averaging       (baseline)
-  model2_500m  — 504M params, context=2048, no averaging       (bigger model + 2× context)
-  avg_125m_k2  — 124M params, context=1024, k=2 averaging     (effective 2× context via compression)
+  model1_50m   —  51M params, d=512/h=8/l=8,   context=1024, no averaging   (baseline)
+  model2_200m  — 202M params, d=1024/h=16/l=12, context=2048, no averaging  (larger + 2× context)
+  avg_50m_k2   —  51M params, d=512/h=8/l=8,   context=1024, k=2 averaging  (effective 2× context)
 
-The key research question: can a small model with token averaging match the
-quality of a 4× larger model trained with a genuine 2× context window, at a
-fraction of the FLOPs?
+Training budget: 4B tokens each.
 
 Parameter estimates
 -------------------
   N ≈ vocab_size × d_model  +  n_layers × 12 × d_model²
 
-  model1_125m : 50257 × 768  + 12 × 12 × 768²   = 38.6M +  85.0M ≈ 124M
-  model2_500m : 50257 × 1024 + 36 × 12 × 1024²  = 51.5M + 453.0M ≈ 504M
-  avg_125m_k2 : same backbone as model1_125m ≈ 124M
+  model1_50m  : 50257 × 512  +  8 × 12 × 512²   = 25.7M +  25.2M ≈  51M
+  model2_200m : 50257 × 1024 + 12 × 12 × 1024²  = 51.5M + 150.9M ≈ 202M
+  avg_50m_k2  : same backbone as model1_50m ≈ 51M
 
 FLOPs estimates on 8× A6000 (~155 TFLOPS BF16 × 8, ~50% MFU → 620 TFLOPS eff.)
 ----------------------------------------------------------------------------------
-  model1_125m  : C = 6 × 124M × 10B  = 7.44 × 10¹⁸ FLOPs  ≈   3.3 h
-  avg_125m_k2  : C = 6 × 124M × 5B   = 3.72 × 10¹⁸ FLOPs  ≈   1.7 h  (k=2 halves transformer tokens)
-  model2_500m  : C = 6 × 504M × 10B  = 3.02 × 10¹⁹ FLOPs  ≈  13.5 h
-  Total sequential                                           ≈  18.5 h
+  model1_50m   : C = 6 × 51M  × 4B  = 1.22 × 10¹⁸ FLOPs  ≈  0.5 h
+  avg_50m_k2   : C = 6 × 51M  × 2B  = 0.61 × 10¹⁸ FLOPs  ≈  0.3 h  (k=2 halves transformer tokens)
+  model2_200m  : C = 6 × 202M × 4B  = 4.85 × 10¹⁸ FLOPs  ≈  2.2 h
+  Total sequential                                          ≈  3.0 h
 """
 
 from __future__ import annotations
@@ -35,7 +33,7 @@ from typing import Dict
 # ModelConfig dataclass
 # ---------------------------------------------------------------------------
 
-TARGET_TOKENS = 10_000_000_000  # 10B tokens for every model
+TARGET_TOKENS = 4_000_000_000   # 4B tokens for every model
 
 
 @dataclass
@@ -46,8 +44,8 @@ class ModelConfig:
     name: str
 
     # OLMTransformerBody architecture hyperparameters.
-    # model1_125m / avg_125m_k2 share d=768/h=12/l=12/ctx=1024.
-    # model2_500m uses d=1024/h=16/l=36/ctx=2048 for ~504M params + 2× context.
+    # model1_50m / avg_50m_k2 share d=512/h=8/l=8/ctx=1024 (~51M params).
+    # model2_200m uses d=1024/h=16/l=12/ctx=2048 (~202M params + 2× context).
     d_model: int
     n_heads: int
     n_layers: int
@@ -108,49 +106,49 @@ class ModelConfig:
 # ---------------------------------------------------------------------------
 
 MODEL_CONFIGS: Dict[str, ModelConfig] = {
-    "model1_125m": ModelConfig(
-        name="model1_125m",
-        d_model=768,
-        n_heads=12,
-        n_layers=12,
+    "model1_50m": ModelConfig(
+        name="model1_50m",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
         context_len=1024,
         averaging_k=1,
         grad_checkpoint=False,
-        color="#58a6ff",  # blue
-        label="125M standard",
+        color="#58a6ff",        # blue
+        label="51M standard",
         lr=3e-4,
-        warmup_steps=2_000,
+        warmup_steps=1_000,
     ),
-    "model2_500m": ModelConfig(
-        name="model2_500m",
+    "model2_200m": ModelConfig(
+        name="model2_200m",
         d_model=1024,
         n_heads=16,
-        n_layers=36,
-        context_len=2048,       # 2× context vs model1_125m
-        averaging_k=1,
-        grad_checkpoint=True,   # 504M params + seq=2048 requires checkpointing on A6000
-        color="#f78166",        # coral
-        label="500M 2× context",
-        lr=1e-4,                # lower lr for larger model
-        warmup_steps=2_000,
-    ),
-    "avg_125m_k2": ModelConfig(
-        name="avg_125m_k2",
-        d_model=768,
-        n_heads=12,
         n_layers=12,
+        context_len=2048,       # 2× context vs model1
+        averaging_k=1,
+        grad_checkpoint=True,
+        color="#f78166",        # coral
+        label="202M 2× context",
+        lr=1e-4,
+        warmup_steps=1_000,
+    ),
+    "avg_50m_k2": ModelConfig(
+        name="avg_50m_k2",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
         context_len=1024,
         averaging_k=2,
         grad_checkpoint=False,
-        color="#3fb950",  # green
-        label="125M + 2× averaging",
+        color="#3fb950",        # green
+        label="51M + 2× averaging",
         lr=3e-4,
-        warmup_steps=2_000,
+        warmup_steps=1_000,
     ),
 }
 
-# Ordered list for sequential training (smallest to largest to warm up the run)
-TRAINING_ORDER = ["model1_125m", "avg_125m_k2", "model2_500m"]
+# Ordered list for sequential training (smallest to largest)
+TRAINING_ORDER = ["model1_50m", "avg_50m_k2", "model2_200m"]
 
 
 def get_config(name: str) -> ModelConfig:
