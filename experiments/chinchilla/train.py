@@ -157,18 +157,49 @@ def _build_optimizer(model: nn.Module, lr: float, weight_decay: float = 0.1):
 
 
 def _enable_gradient_checkpointing(backbone: OLMTransformerBody) -> None:
-    """Wrap each child of the transformer body with torch gradient checkpointing."""
+    """
+    Patch the transformer body to run each layer through gradient checkpointing.
+
+    OLM stores transformer layers inside a ModuleList (which has no forward()).
+    We unwrap ModuleList containers one level so we checkpoint individual
+    callable layers, not the container itself.
+    """
     body = backbone.body
+
+    # HuggingFace-style convenience hook (not present in plain OLM blocks)
     if hasattr(body, "gradient_checkpointing_enable"):
         body.gradient_checkpointing_enable()
         return
-    children = list(body.children())
-    if children:
-        def _ckpt_forward(x: torch.Tensor) -> torch.Tensor:
-            for m in children:
-                x = gradient_checkpoint(m, x, use_reentrant=False)
-            return x
-        body.forward = _ckpt_forward
+
+    # Collect the actual transformer layers.
+    # OLM body structure: Sequential/Block → [ModuleList([layer0, layer1, ...])]
+    # We need the individual layers, not the ModuleList wrapper.
+    layers: list = []
+    for child in body.children():
+        if isinstance(child, nn.ModuleList):
+            # Unwrap: add each transformer layer individually
+            layers.extend(list(child))
+        else:
+            layers.append(child)
+
+    if not layers:
+        return
+
+    # Verify every collected module is callable (has a real forward).
+    # If any are still ModuleList, wrap them in Sequential so they become callable.
+    callable_layers = []
+    for m in layers:
+        if isinstance(m, nn.ModuleList):
+            callable_layers.append(nn.Sequential(*m))
+        else:
+            callable_layers.append(m)
+
+    def _ckpt_forward(x: torch.Tensor) -> torch.Tensor:
+        for layer in callable_layers:
+            x = gradient_checkpoint(layer, x, use_reentrant=False)
+        return x
+
+    body.forward = _ckpt_forward
 
 
 # ---------------------------------------------------------------------------
