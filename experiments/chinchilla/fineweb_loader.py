@@ -283,21 +283,36 @@ def prepare_dataset(
     )
 
     # ── Step 4: parallel tokenisation → temp .bin files (no IPC bottleneck) ──
-    print(
-        f"[fineweb_loader] Tokenising {len(local_files)} shard(s) "
-        f"with {num_proc} workers …",
-        flush=True,
-    )
-    jobs = [(str(f), tokenizer_name, eos_id) for f in local_files]
+    # Resume-friendly: reuse any .tok.bin files already on disk so a killed
+    # run can restart and jump straight to the split step.
     tok_files: list[Path] = []
     tok_counts: list[int] = []
-    with mp.Pool(num_proc) as pool:
-        for i, (tmp_path, n_tok) in enumerate(
-            pool.imap(_tokenize_parquet_to_file, jobs), 1
-        ):
-            tok_files.append(Path(tmp_path))
-            tok_counts.append(n_tok)
-            print(f"  [{i}/{len(jobs)}] {n_tok/1e6:.1f}M tokens → {tmp_path}", flush=True)
+    missing = [f for f in local_files if not Path(str(f) + ".tok.bin").exists()]
+    if missing:
+        print(
+            f"[fineweb_loader] Tokenising {len(missing)} shard(s) "
+            f"({len(local_files) - len(missing)} already cached) "
+            f"with {num_proc} workers …",
+            flush=True,
+        )
+        jobs = [(str(f), tokenizer_name, eos_id) for f in missing]
+        with mp.Pool(num_proc) as pool:
+            for i, (tmp_path, n_tok) in enumerate(
+                pool.imap(_tokenize_parquet_to_file, jobs), 1
+            ):
+                print(f"  [{i}/{len(jobs)}] {n_tok/1e6:.1f}M tokens → {tmp_path}", flush=True)
+    else:
+        print(
+            f"[fineweb_loader] All {len(local_files)} .tok.bin files already exist — "
+            "skipping tokenisation.",
+            flush=True,
+        )
+
+    for f in local_files:
+        tok_f = Path(str(f) + ".tok.bin")
+        n_tok = len(np.memmap(tok_f, dtype=DTYPE, mode="r"))
+        tok_files.append(tok_f)
+        tok_counts.append(n_tok)
 
     # ── Step 5: doc-level eval/train split, concat temp files → .bin ─────────
     print("[fineweb_loader] Splitting eval/train and writing .bin files …", flush=True)
