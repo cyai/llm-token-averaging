@@ -216,9 +216,11 @@ def prepare_dataset(
     )
 
     def _stream_shard(out_path: Path, label: str,
-                      skip: int, max_tokens: Optional[int]):
+                      skip: int, max_docs: Optional[int],
+                      max_tokens: Optional[int]):
         """Stream, tokenise in chunks, write to out_path. Returns tokens written."""
-        total = 0
+        total    = 0
+        docs_seen = 0
         buf: list[str] = []
 
         def _flush(buf, max_remaining):
@@ -229,40 +231,55 @@ def prepare_dataset(
             arr.tofile(f)
             return len(arr)
 
+        max_tok_str = f"{max_tokens/1e6:.0f}M" if max_tokens else "∞"
+        max_doc_str = f"{max_docs:,}" if max_docs else "∞"
+        print(
+            f"  [{label}] writing (max_docs={max_doc_str}, max_tokens={max_tok_str}) …",
+            flush=True,
+        )
+
         with open(out_path, "wb") as f:
             ds = load_dataset(
                 FINEWEB_REPO, name=FINEWEB_SUBSET, split="train", streaming=True
             )
-            for doc_i, example in enumerate(ds):
-                if doc_i < skip:
+            for abs_i, example in enumerate(ds):
+                if abs_i < skip:
                     continue
+
                 buf.append(example["text"])
-                if len(buf) >= chunk_size:
+                docs_seen += 1
+
+                # flush when buffer is full or we've hit the doc limit
+                at_doc_limit = (max_docs is not None and docs_seen >= max_docs)
+                if len(buf) >= chunk_size or at_doc_limit:
                     remaining = None if max_tokens is None else max_tokens - total
                     written   = _flush(buf, remaining)
                     buf       = []
                     total    += written
                     print(
-                        f"  [{label}] {total/1e6:.0f}M"
-                        + (f"/{max_tokens/1e6:.0f}M" if max_tokens else "")
-                        + " tokens",
+                        f"  [{label}] {docs_seen:,} docs | "
+                        f"{total/1e6:.1f}M/{max_tok_str} tokens",
                         flush=True,
                     )
-                    if max_tokens and total >= max_tokens:
+                    if at_doc_limit or (max_tokens and total >= max_tokens):
                         break
 
+            # flush any remainder
             if buf and (max_tokens is None or total < max_tokens):
                 remaining = None if max_tokens is None else max_tokens - total
                 total    += _flush(buf, remaining)
 
         print(
-            f"  [{label}] Done — {total/1e6:.0f}M tokens → {out_path}",
+            f"  [{label}] Done — {docs_seen:,} docs, "
+            f"{total/1e6:.1f}M tokens → {out_path}",
             flush=True,
         )
         return total
 
-    _stream_shard(eval_path,  "eval",  skip=0,         max_tokens=None)
-    _stream_shard(train_path, "train", skip=EVAL_DOCS, max_tokens=max_train_tokens)
+    _stream_shard(eval_path,  "eval",  skip=0,
+                  max_docs=EVAL_DOCS, max_tokens=None)
+    _stream_shard(train_path, "train", skip=EVAL_DOCS,
+                  max_docs=None,      max_tokens=max_train_tokens)
 
     return train_path, eval_path
 
