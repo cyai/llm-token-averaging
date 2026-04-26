@@ -118,7 +118,7 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         label="~8M standard (n=512)",
         lr=4e-4,
         warmup_steps=500,
-        target_tokens=280_000_000,
+        target_tokens=300_000_000,
     ),
     "avg_8m_k2": ModelConfig(
         name="avg_8m_k2",
@@ -132,7 +132,7 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         label="~8M + 2× averaging",
         lr=4e-4,
         warmup_steps=500,
-        target_tokens=560_000_000,
+        target_tokens=600_000_000,
     ),
     "model2_8m_ctx2n": ModelConfig(
         name="model2_8m_ctx2n",
@@ -146,7 +146,7 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         label="~8M standard (2n=1024)",
         lr=4e-4,
         warmup_steps=500,
-        target_tokens=280_000_000,
+        target_tokens=300_000_000,
     ),
 }
 
