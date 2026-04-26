@@ -585,7 +585,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--model",            required=True,
-                   choices=["model1_50m", "model2_200m", "avg_50m_k2"])
+                   choices=["model1_50m", "model2_200m", "avg_50m_k2", "model1_8m", "avg_8m_k2", "model2_8m_ctx2n"])
     p.add_argument("--batch_size",       type=int, default=16,
                    help="Per-GPU batch size.")
     p.add_argument("--seq_len",          type=int, default=1024)
