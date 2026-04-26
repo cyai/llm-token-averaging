@@ -50,18 +50,19 @@ if str(_ROOT) not in sys.path:
 # Constants
 # ---------------------------------------------------------------------------
 
-FINEWEB_REPO   = "HuggingFaceFW/fineweb"
+FINEWEB_REPO = "HuggingFaceFW/fineweb"
 FINEWEB_SUBSET = "sample-10BT"
 
 # First EVAL_DOCS documents are reserved as the held-out eval shard.
-EVAL_DOCS = 5_000   # ~50M tokens at typical FineWeb document lengths
+EVAL_DOCS = 5_000  # ~50M tokens at typical FineWeb document lengths
 
-DTYPE = np.uint16   # GPT-NeoX vocab = 50 257, fits in uint16
+DTYPE = np.uint16  # GPT-NeoX vocab = 50 257, fits in uint16
 
 
 # ---------------------------------------------------------------------------
 # 1.  LOCAL BINARY CACHE  (fastest path)
 # ---------------------------------------------------------------------------
+
 
 class _LocalBinDataset(Dataset):
     """
@@ -77,9 +78,9 @@ class _LocalBinDataset(Dataset):
     def __init__(self, path: Path, seq_len: int):
         self.seq_len = seq_len
         # +1 so we can return seq_len tokens (the LM shifts internally)
-        self.data    = np.memmap(path, dtype=DTYPE, mode="r")
+        self.data = np.memmap(path, dtype=DTYPE, mode="r")
         # Number of complete, non-overlapping windows
-        self.n_seqs  = (len(self.data) - 1) // seq_len
+        self.n_seqs = (len(self.data) - 1) // seq_len
 
     def __len__(self):
         return self.n_seqs
@@ -101,21 +102,22 @@ def _build_local_dataloaders(
     from torch.utils.data import DistributedSampler
 
     train_path = data_dir / "train.bin"
-    eval_path  = data_dir / "eval.bin"
+    eval_path = data_dir / "eval.bin"
 
     train_ds = _LocalBinDataset(train_path, seq_len)
-    eval_ds  = _LocalBinDataset(eval_path,  seq_len)
+    eval_ds = _LocalBinDataset(eval_path, seq_len)
 
     train_sampler = (
         DistributedSampler(train_ds, shuffle=True, drop_last=True)
-        if distributed else None
+        if distributed
+        else None
     )
 
     train_dl = DataLoader(
         train_ds,
         batch_size=batch_size,
         sampler=train_sampler,
-        shuffle=(train_sampler is None),   # shuffle only when not using DDP sampler
+        shuffle=(train_sampler is None),  # shuffle only when not using DDP sampler
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=(num_workers > 0),
@@ -138,6 +140,7 @@ def _build_local_dataloaders(
 # 2.  DATASET PREPARATION  (run once, produces the .bin files above)
 # ---------------------------------------------------------------------------
 
+
 def _tokenize_batch(args):
     """Top-level function (picklable) used by multiprocessing pool."""
     texts, tokenizer_name, eos_id = args
@@ -155,18 +158,25 @@ def prepare_dataset(
     tokenizer_name: str = "EleutherAI/pythia-70m",
     num_proc: int = 4,
     chunk_size: int = 1_000,
+    max_train_tokens: Optional[int] = None,
     force: bool = False,
 ) -> tuple[Path, Path]:
     """
-    Download FineWeb sample-10BT, tokenise it, and write flat uint16 binary
+    Stream FineWeb sample-10BT, tokenise it, and write flat uint16 binary
     files to data_dir/train.bin and data_dir/eval.bin.
 
+    Uses streaming=True so only the documents actually needed are fetched —
+    no need to download the full ~27 GB dataset when you only need 320M tokens.
+
     Args:
-        data_dir       : directory to write the .bin files
-        tokenizer_name : HuggingFace tokenizer identifier
-        num_proc       : parallel tokenisation workers
-        chunk_size     : documents per worker chunk
-        force          : re-create files even if they already exist
+        data_dir         : directory to write the .bin files
+        tokenizer_name   : HuggingFace tokenizer identifier
+        num_proc         : parallel tokenisation workers (unused in streaming
+                           mode — tokenisation is done in the main thread to
+                           avoid multiprocessing + streaming conflicts)
+        chunk_size       : documents buffered before flushing to disk
+        max_train_tokens : stop after this many train tokens (None = full dataset)
+        force            : re-create files even if they already exist
 
     Returns:
         (train_path, eval_path)
@@ -181,53 +191,78 @@ def prepare_dataset(
     if train_path.exists() and eval_path.exists() and not force:
         train_tok = len(np.memmap(train_path, dtype=DTYPE, mode="r"))
         eval_tok  = len(np.memmap(eval_path,  dtype=DTYPE, mode="r"))
+        if max_train_tokens is None or train_tok >= max_train_tokens:
+            print(
+                f"[fineweb_loader] Cache already exists — "
+                f"train: {train_tok/1e6:.0f}M tok, eval: {eval_tok/1e6:.0f}M tok.\n"
+                f"  Pass force=True to re-build.",
+                flush=True,
+            )
+            return train_path, eval_path
         print(
-            f"[fineweb_loader] Local cache already exists — "
-            f"train: {train_tok/1e9:.2f}B tok, eval: {eval_tok/1e6:.0f}M tok\n"
-            f"  Pass force=True to re-build.",
+            f"[fineweb_loader] Cache has {train_tok/1e6:.0f}M train tokens "
+            f"but {max_train_tokens/1e6:.0f}M requested — rebuilding.",
             flush=True,
         )
-        return train_path, eval_path
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
     eos_id    = tokenizer.eos_token_id or 0
 
-    print(f"[fineweb_loader] Downloading {FINEWEB_REPO}/{FINEWEB_SUBSET} …", flush=True)
-    ds = load_dataset(FINEWEB_REPO, name=FINEWEB_SUBSET, split="train",
-                      streaming=False)   # downloads to HF cache (~27 GB)
-    print(f"[fineweb_loader] Downloaded {len(ds):,} documents. Tokenising …", flush=True)
+    budget_str = f"{max_train_tokens/1e6:.0f}M" if max_train_tokens else "full dataset"
+    print(
+        f"[fineweb_loader] Streaming {FINEWEB_REPO}/{FINEWEB_SUBSET} "
+        f"(target: {budget_str} train tokens) …",
+        flush=True,
+    )
 
-    def _write_shard(indices, out_path: Path, label: str):
-        # Batch documents into chunks for the process pool
-        chunks = [
-            ([ds[i]["text"] for i in indices[s : s + chunk_size]],
-             tokenizer_name, eos_id)
-            for s in range(0, len(indices), chunk_size)
-        ]
-        all_ids: list[int] = []
-        with mp.Pool(num_proc) as pool:
-            for k, batch_ids in enumerate(pool.imap(_tokenize_batch, chunks)):
-                all_ids.extend(batch_ids)
-                if k % 10 == 0:
+    def _stream_shard(out_path: Path, label: str,
+                      skip: int, max_tokens: Optional[int]):
+        """Stream, tokenise in chunks, write to out_path. Returns tokens written."""
+        total = 0
+        buf: list[str] = []
+
+        def _flush(buf, max_remaining):
+            ids = _tokenize_batch((buf, tokenizer_name, eos_id))
+            if max_remaining is not None:
+                ids = ids[:max_remaining]
+            arr = np.array(ids, dtype=DTYPE)
+            arr.tofile(f)
+            return len(arr)
+
+        with open(out_path, "wb") as f:
+            ds = load_dataset(
+                FINEWEB_REPO, name=FINEWEB_SUBSET, split="train", streaming=True
+            )
+            for doc_i, example in enumerate(ds):
+                if doc_i < skip:
+                    continue
+                buf.append(example["text"])
+                if len(buf) >= chunk_size:
+                    remaining = None if max_tokens is None else max_tokens - total
+                    written   = _flush(buf, remaining)
+                    buf       = []
+                    total    += written
                     print(
-                        f"  [{label}] {k}/{len(chunks)} chunks "
-                        f"({len(all_ids)/1e6:.0f}M tokens so far)",
+                        f"  [{label}] {total/1e6:.0f}M"
+                        + (f"/{max_tokens/1e6:.0f}M" if max_tokens else "")
+                        + " tokens",
                         flush=True,
                     )
-        arr = np.array(all_ids, dtype=DTYPE)
-        arr.tofile(out_path)
+                    if max_tokens and total >= max_tokens:
+                        break
+
+            if buf and (max_tokens is None or total < max_tokens):
+                remaining = None if max_tokens is None else max_tokens - total
+                total    += _flush(buf, remaining)
+
         print(
-            f"  [{label}] Saved {len(arr)/1e9:.3f}B tokens → {out_path}",
+            f"  [{label}] Done — {total/1e6:.0f}M tokens → {out_path}",
             flush=True,
         )
-        return out_path
+        return total
 
-    all_idx   = list(range(len(ds)))
-    eval_idx  = all_idx[:EVAL_DOCS]
-    train_idx = all_idx[EVAL_DOCS:]
-
-    _write_shard(eval_idx,  eval_path,  "eval")
-    _write_shard(train_idx, train_path, "train")
+    _stream_shard(eval_path,  "eval",  skip=0,         max_tokens=None)
+    _stream_shard(train_path, "train", skip=EVAL_DOCS, max_tokens=max_train_tokens)
 
     return train_path, eval_path
 
@@ -235,6 +270,7 @@ def prepare_dataset(
 # ---------------------------------------------------------------------------
 # 3.  OLM-NATIVE STREAMING LOADER  (second preference)
 # ---------------------------------------------------------------------------
+
 
 def _build_olm_dataloaders(
     tokenizer: PreTrainedTokenizerBase,
@@ -269,18 +305,24 @@ def _build_olm_dataloaders(
         )
 
     train_ds = _make_hf_dataset(skip=EVAL_DOCS, shuffle=True)
-    eval_ds  = _make_hf_dataset(take=EVAL_DOCS, shuffle=False)
+    eval_ds = _make_hf_dataset(take=EVAL_DOCS, shuffle=False)
 
-    train_dl = OLMDataLoader(train_ds, batch_size=batch_size,
-                             num_workers=num_workers, distributed=distributed)
-    eval_dl  = OLMDataLoader(eval_ds,  batch_size=batch_size,
-                             num_workers=num_workers, distributed=False)
+    train_dl = OLMDataLoader(
+        train_ds,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        distributed=distributed,
+    )
+    eval_dl = OLMDataLoader(
+        eval_ds, batch_size=batch_size, num_workers=num_workers, distributed=False
+    )
     return train_dl, eval_dl
 
 
 # ---------------------------------------------------------------------------
 # 4.  HAND-ROLLED STREAMING FALLBACK  (last resort)
 # ---------------------------------------------------------------------------
+
 
 def _doc_stream(
     skip: int = 0,
@@ -289,8 +331,8 @@ def _doc_stream(
     world_size: int = 1,
 ) -> Iterator[str]:
     from datasets import load_dataset
-    ds      = load_dataset(FINEWEB_REPO, name=FINEWEB_SUBSET,
-                           split="train", streaming=True)
+
+    ds = load_dataset(FINEWEB_REPO, name=FINEWEB_SUBSET, split="train", streaming=True)
     yielded = 0
     shard_i = 0
     for abs_i, example in enumerate(ds):
@@ -324,23 +366,24 @@ def _tokenize_and_pack(
 class _FallbackTrainDataset(IterableDataset):
     def __init__(self, tokenizer, seq_len, rank=0, world_size=1):
         super().__init__()
-        self.tokenizer  = tokenizer
-        self.seq_len    = seq_len
-        self.rank       = rank
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self.rank = rank
         self.world_size = world_size
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is not None:
             eff_rank = self.rank * worker_info.num_workers + worker_info.id
-            eff_ws   = self.world_size * worker_info.num_workers
+            eff_ws = self.world_size * worker_info.num_workers
         else:
             eff_rank = self.rank
-            eff_ws   = self.world_size
+            eff_ws = self.world_size
         while True:
             yield from _tokenize_and_pack(
                 _doc_stream(skip=EVAL_DOCS, rank=eff_rank, world_size=eff_ws),
-                self.tokenizer, self.seq_len,
+                self.tokenizer,
+                self.seq_len,
             )
 
 
@@ -348,18 +391,20 @@ class _FallbackEvalDataset(IterableDataset):
     def __init__(self, tokenizer, seq_len):
         super().__init__()
         self.tokenizer = tokenizer
-        self.seq_len   = seq_len
+        self.seq_len = seq_len
 
     def __iter__(self):
         yield from _tokenize_and_pack(
             _doc_stream(skip=0, take=EVAL_DOCS, rank=0, world_size=1),
-            self.tokenizer, self.seq_len,
+            self.tokenizer,
+            self.seq_len,
         )
 
 
 # ---------------------------------------------------------------------------
 # Public factory
 # ---------------------------------------------------------------------------
+
 
 def build_dataloaders(
     tokenizer: PreTrainedTokenizerBase,
@@ -392,13 +437,13 @@ def build_dataloaders(
         data_dir   : path to directory containing train.bin / eval.bin;
                      if None or files missing, falls back to streaming
     """
-    is_main = (rank == 0)
+    is_main = rank == 0
 
     # ── 1. Local binary cache ────────────────────────────────────────────────
     if data_dir is not None:
-        data_dir   = Path(data_dir)
+        data_dir = Path(data_dir)
         train_path = data_dir / "train.bin"
-        eval_path  = data_dir / "eval.bin"
+        eval_path = data_dir / "eval.bin"
         if train_path.exists() and eval_path.exists():
             if is_main:
                 tok_count = len(np.memmap(train_path, dtype=DTYPE, mode="r"))
@@ -409,7 +454,11 @@ def build_dataloaders(
                     flush=True,
                 )
             return _build_local_dataloaders(
-                data_dir, seq_len, batch_size, num_workers, distributed,
+                data_dir,
+                seq_len,
+                batch_size,
+                num_workers,
+                distributed,
             )
         elif is_main:
             print(
@@ -421,8 +470,11 @@ def build_dataloaders(
     # ── 2. OLM-native streaming ──────────────────────────────────────────────
     try:
         loaders = _build_olm_dataloaders(
-            tokenizer=tokenizer, seq_len=seq_len, batch_size=batch_size,
-            num_workers=num_workers, distributed=distributed,
+            tokenizer=tokenizer,
+            seq_len=seq_len,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            distributed=distributed,
         )
         if is_main:
             print("[fineweb_loader] Using OLM HuggingFaceTextDataset.", flush=True)
@@ -447,18 +499,23 @@ def build_dataloaders(
             flush=True,
         )
 
-    train_ds = _FallbackTrainDataset(tokenizer, seq_len, rank=rank, world_size=world_size)
-    eval_ds  = _FallbackEvalDataset(tokenizer, seq_len)
-    train_dl = DataLoader(train_ds, batch_size=batch_size,
-                          num_workers=stream_workers, pin_memory=True)
-    eval_dl  = DataLoader(eval_ds,  batch_size=batch_size,
-                          num_workers=stream_workers, pin_memory=True)
+    train_ds = _FallbackTrainDataset(
+        tokenizer, seq_len, rank=rank, world_size=world_size
+    )
+    eval_ds = _FallbackEvalDataset(tokenizer, seq_len)
+    train_dl = DataLoader(
+        train_ds, batch_size=batch_size, num_workers=stream_workers, pin_memory=True
+    )
+    eval_dl = DataLoader(
+        eval_ds, batch_size=batch_size, num_workers=stream_workers, pin_memory=True
+    )
     return train_dl, eval_dl
 
 
 # ---------------------------------------------------------------------------
 # Utility
 # ---------------------------------------------------------------------------
+
 
 def estimate_total_batches(
     target_tokens: int,
@@ -478,19 +535,30 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(
         description="Pre-tokenise FineWeb sample-10BT to local binary files."
     )
-    p.add_argument("--data_dir",   required=True,
-                   help="Output directory for train.bin / eval.bin")
-    p.add_argument("--tokenizer",  default="EleutherAI/pythia-70m")
-    p.add_argument("--num_proc",   type=int, default=mp.cpu_count(),
-                   help="Parallel tokenisation workers (default: all CPUs)")
-    p.add_argument("--force",      action="store_true",
-                   help="Re-build even if .bin files already exist")
+    p.add_argument(
+        "--data_dir", required=True, help="Output directory for train.bin / eval.bin"
+    )
+    p.add_argument("--tokenizer", default="EleutherAI/pythia-70m")
+    p.add_argument(
+        "--num_proc", type=int, default=mp.cpu_count(),
+        help="Tokenisation workers (default: all CPUs)",
+    )
+    p.add_argument(
+        "--max_train_tokens", type=int, default=None,
+        help="Stop after this many train tokens, e.g. 320000000. "
+             "Omit to tokenise the full ~10B-token dataset.",
+    )
+    p.add_argument(
+        "--force", action="store_true",
+        help="Re-build even if .bin files already exist",
+    )
     args = p.parse_args()
 
     train_p, eval_p = prepare_dataset(
-        data_dir       = args.data_dir,
-        tokenizer_name = args.tokenizer,
-        num_proc       = args.num_proc,
-        force          = args.force,
+        data_dir         = args.data_dir,
+        tokenizer_name   = args.tokenizer,
+        num_proc         = args.num_proc,
+        max_train_tokens = args.max_train_tokens,
+        force            = args.force,
     )
     print(f"\nDone.\n  train → {train_p}\n  eval  → {eval_p}")
