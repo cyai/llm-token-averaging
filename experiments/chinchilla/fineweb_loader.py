@@ -168,18 +168,36 @@ def _download_shards_parallel(
     return [results[p] for p in shard_paths]
 
 
-def _tokenize_parquet_file(args) -> list[int]:
-    """Top-level picklable worker: tokenise one parquet file."""
+def _tokenize_parquet_to_file(args) -> tuple[str, int]:
+    """
+    Top-level picklable worker: tokenise one parquet shard and write
+    tokens directly to a .bin temp file beside the parquet.
+
+    Returns (tmp_path, token_count) — no large data crosses the IPC pipe.
+    """
     parquet_path, tokenizer_name, eos_id = args
     import pyarrow.parquet as pq
-    tok    = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
-    table  = pq.read_table(parquet_path, columns=["text"])
-    ids: list[int] = []
-    for text in table.column("text").to_pylist():
-        if text and text.strip():
-            ids.extend(tok.encode(text, add_special_tokens=False))
-            ids.append(eos_id)
-    return ids
+
+    out_path = str(parquet_path) + ".tok.bin"
+    tok   = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+    table = pq.read_table(parquet_path, columns=["text"])
+    texts = table.column("text").to_pylist()
+    total = 0
+    CHUNK = 10_000   # docs per flush to keep memory low
+
+    with open(out_path, "wb") as f:
+        buf: list[int] = []
+        for i, text in enumerate(texts):
+            if text and text.strip():
+                buf.extend(tok.encode(text, add_special_tokens=False))
+                buf.append(eos_id)
+            if len(buf) >= CHUNK * 256 or i == len(texts) - 1:
+                arr = np.array(buf, dtype=np.uint16)
+                arr.tofile(f)
+                total += len(arr)
+                buf   = []
+
+    return out_path, total
 
 
 def prepare_dataset(
@@ -264,65 +282,80 @@ def prepare_dataset(
         all_shards[:n_shards], raw_dir, max_workers=dl_workers
     )
 
-    # ── Step 4: parallel tokenisation ────────────────────────────────────────
+    # ── Step 4: parallel tokenisation → temp .bin files (no IPC bottleneck) ──
     print(
         f"[fineweb_loader] Tokenising {len(local_files)} shard(s) "
         f"with {num_proc} workers …",
         flush=True,
     )
     jobs = [(str(f), tokenizer_name, eos_id) for f in local_files]
-    shard_tokens: list[list[int]] = []
+    tok_files: list[Path] = []
+    tok_counts: list[int] = []
     with mp.Pool(num_proc) as pool:
-        for i, ids in enumerate(pool.imap(_tokenize_parquet_file, jobs), 1):
-            shard_tokens.append(ids)
-            print(f"  [{i}/{len(jobs)}] {len(ids)/1e6:.1f}M tokens", flush=True)
+        for i, (tmp_path, n_tok) in enumerate(
+            pool.imap(_tokenize_parquet_to_file, jobs), 1
+        ):
+            tok_files.append(Path(tmp_path))
+            tok_counts.append(n_tok)
+            print(f"  [{i}/{len(jobs)}] {n_tok/1e6:.1f}M tokens → {tmp_path}", flush=True)
 
-    # ── Step 5: doc-level eval/train split ───────────────────────────────────
+    # ── Step 5: doc-level eval/train split, concat temp files → .bin ─────────
     print("[fineweb_loader] Splitting eval/train and writing .bin files …", flush=True)
 
+    # Re-tokenise only the first EVAL_DOCS docs from shard 0 → eval.bin.
+    # We stream shard 0 in batches so we never load the full 2 GB parquet.
+    # The pre-tokenised tok_files[0] is used for train (skipping eval tokens).
+    tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+    pf0 = pq.ParquetFile(local_files[0])
+
     eval_ids:  list[int] = []
-    train_ids: list[int] = []
-    docs_seen  = 0
-    eval_done  = False
-
-    for local_f, ids in zip(local_files, shard_tokens):
-        n_docs = pq.read_table(local_f, columns=["text"]).num_rows
-
-        if not eval_done:
-            docs_for_eval = EVAL_DOCS - docs_seen
-            if n_docs <= docs_for_eval:
-                eval_ids.extend(ids)
-                docs_seen += n_docs
-                if docs_seen >= EVAL_DOCS:
-                    eval_done = True
-            else:
-                # This shard straddles the eval/train boundary — re-tokenise by doc
-                tok   = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
-                texts = pq.read_table(local_f, columns=["text"]).column("text").to_pylist()
-                for doc_i, text in enumerate(texts):
-                    if not text or not text.strip():
-                        continue
-                    toks = tok.encode(text, add_special_tokens=False) + [eos_id]
-                    if doc_i < docs_for_eval:
-                        eval_ids.extend(toks)
-                    else:
-                        train_ids.extend(toks)
-                docs_seen = EVAL_DOCS
-                eval_done = True
-        else:
-            train_ids.extend(ids)
-
-        if max_train_tokens and len(train_ids) >= max_train_tokens:
-            train_ids = train_ids[:max_train_tokens]
+    docs_seen: int = 0
+    for batch in pf0.iter_batches(batch_size=1_000, columns=["text"]):
+        for text in batch.column("text").to_pylist():
+            if docs_seen >= EVAL_DOCS:
+                break
+            if text and text.strip():
+                eval_ids.extend(tok.encode(text, add_special_tokens=False) + [eos_id])
+                docs_seen += 1
+        if docs_seen >= EVAL_DOCS:
             break
 
-    np.array(eval_ids,  dtype=DTYPE).tofile(eval_path)
-    np.array(train_ids, dtype=DTYPE).tofile(train_path)
+    eval_token_count = len(eval_ids)
+    np.array(eval_ids, dtype=DTYPE).tofile(eval_path)
+    print(f"  eval  → {eval_path}  ({eval_token_count/1e6:.1f}M tokens)", flush=True)
+    del eval_ids
+
+    # Write train.bin: shard 0 from tok_files[0] (skip eval tokens at head),
+    # then remaining shards in full until max_train_tokens is reached.
+    with open(train_path, "wb") as out_f:
+        total_train = 0
+        for shard_i, (tok_f, n_tok) in enumerate(zip(tok_files, tok_counts)):
+            data = np.fromfile(tok_f, dtype=DTYPE)
+            if shard_i == 0:
+                data = data[eval_token_count:]   # skip the eval head
+            remaining = (
+                max_train_tokens - total_train
+                if max_train_tokens else len(data)
+            )
+            data = data[:remaining]
+            out_f.write(data.tobytes())
+            total_train += len(data)
+            print(
+                f"  shard {shard_i}: +{len(data)/1e6:.1f}M tokens "
+                f"(total {total_train/1e6:.1f}M)",
+                flush=True,
+            )
+            if max_train_tokens and total_train >= max_train_tokens:
+                break
+
+    # Clean up temp token files
+    for tok_f in tok_files:
+        tok_f.unlink(missing_ok=True)
 
     print(
         f"[fineweb_loader] Done.\n"
-        f"  eval  → {eval_path}  ({len(eval_ids)/1e6:.1f}M tokens)\n"
-        f"  train → {train_path}  ({len(train_ids)/1e6:.1f}M tokens)",
+        f"  eval  → {eval_path}  ({eval_token_count/1e6:.1f}M tokens)\n"
+        f"  train → {train_path}  ({total_train/1e6:.1f}M tokens)",
         flush=True,
     )
     return train_path, eval_path
