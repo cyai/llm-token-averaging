@@ -106,44 +106,47 @@ class ModelConfig:
 # ---------------------------------------------------------------------------
 
 MODEL_CONFIGS: Dict[str, ModelConfig] = {
-    "model1_50m": ModelConfig(
-        name="model1_50m",
-        d_model=512,
-        n_heads=8,
-        n_layers=8,
-        context_len=1024,
+    "model1_8m": ModelConfig(
+        name="model1_8m",
+        d_model=128,
+        n_heads=4,
+        n_layers=6,
+        context_len=512,          # n
         averaging_k=1,
         grad_checkpoint=False,
-        color="#58a6ff",        # blue
-        label="51M standard",
-        lr=3e-4,
-        warmup_steps=1_000,
+        color="#58a6ff",
+        label="~8M standard (n=512)",
+        lr=4e-4,
+        warmup_steps=500,
+        target_tokens=160_000_000,
     ),
-    "model2_200m": ModelConfig(
-        name="model2_200m",
-        d_model=1024,
-        n_heads=16,
-        n_layers=12,
-        context_len=2048,       # 2× context vs model1
-        averaging_k=1,
-        grad_checkpoint=True,
-        color="#f78166",        # coral
-        label="202M 2× context",
-        lr=1e-4,
-        warmup_steps=1_000,
-    ),
-    "avg_50m_k2": ModelConfig(
-        name="avg_50m_k2",
-        d_model=512,
-        n_heads=8,
-        n_layers=8,
-        context_len=1024,
-        averaging_k=2,
+    "avg_8m_k2": ModelConfig(
+        name="avg_8m_k2",
+        d_model=128,
+        n_heads=4,
+        n_layers=6,
+        context_len=512,          # compressed length = n
+        averaging_k=2,            # effective raw context = 1024 = 2n
         grad_checkpoint=False,
-        color="#3fb950",        # green
-        label="51M + 2× averaging",
-        lr=3e-4,
-        warmup_steps=1_000,
+        color="#3fb950",
+        label="~8M + 2× averaging",
+        lr=4e-4,
+        warmup_steps=500,
+        target_tokens=320_000_000,
+    ),
+    "model2_8m_ctx2n": ModelConfig(
+        name="model2_8m_ctx2n",
+        d_model=128,
+        n_heads=4,
+        n_layers=6,
+        context_len=1024,         # true 2n context
+        averaging_k=1,
+        grad_checkpoint=False,
+        color="#f78166",
+        label="~8M standard (2n=1024)",
+        lr=4e-4,
+        warmup_steps=500,
+        target_tokens=160_000_000,
     ),
 }
 
