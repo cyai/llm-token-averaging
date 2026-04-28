@@ -33,7 +33,7 @@ from typing import Dict
 # ModelConfig dataclass
 # ---------------------------------------------------------------------------
 
-TARGET_TOKENS = 4_000_000_000   # 4B tokens for every model
+TARGET_TOKENS = 4_000_000_000  # 4B tokens for every model
 
 
 @dataclass
@@ -111,7 +111,7 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         d_model=128,
         n_heads=4,
         n_layers=6,
-        context_len=512,          # n
+        context_len=512,  # n
         averaging_k=1,
         grad_checkpoint=False,
         color="#58a6ff",
@@ -125,8 +125,8 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         d_model=128,
         n_heads=4,
         n_layers=6,
-        context_len=512,          # compressed length = n
-        averaging_k=2,            # effective raw context = 1024 = 2n
+        context_len=512,  # compressed length = n
+        averaging_k=2,  # effective raw context = 1024 = 2n
         grad_checkpoint=False,
         color="#3fb950",
         label="~8M + 2× averaging",
@@ -139,7 +139,7 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         d_model=128,
         n_heads=4,
         n_layers=6,
-        context_len=1024,         # true 2n context
+        context_len=1024,  # true 2n context
         averaging_k=1,
         grad_checkpoint=False,
         color="#f78166",
@@ -153,8 +153,8 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         d_model=128,
         n_heads=4,
         n_layers=6,
-        context_len=512,          # compressed length = n
-        averaging_k=4,            # effective raw context = 1024 = 2n
+        context_len=512,  # compressed length = n
+        averaging_k=4,  # effective raw context = 1024 = 2n
         grad_checkpoint=False,
         color="#3fb950",
         label="~8M + 4× averaging (k=4)",
@@ -167,7 +167,7 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         d_model=128,
         n_heads=4,
         n_layers=6,
-        context_len=2048,         # true 4n context
+        context_len=2048,  # true 4n context
         averaging_k=1,
         grad_checkpoint=False,
         color="#f78166",
@@ -175,6 +175,48 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         lr=4e-4,
         warmup_steps=500,
         target_tokens=400_000_000,
+    ),
+    "model1_50m": ModelConfig(
+        name="model1_50m",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,  # n
+        averaging_k=1,
+        grad_checkpoint=False,
+        color="#4e9de0",
+        label="~50M standard (n=1024)",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=1_000_000_000,
+    ),
+    "model2_50m_ctx2n": ModelConfig(
+        name="model2_50m_ctx2n",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=2048,  # true 2n context
+        averaging_k=1,
+        grad_checkpoint=True,  # 2048 ctx may be tight on VRAM
+        color="#f0a500",
+        label="~50M standard (2n=2048)",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=1_000_000_000,
+    ),
+    "avg_50m_k2": ModelConfig(
+        name="avg_50m_k2",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,  # compressed length = n
+        averaging_k=2,  # effective raw context = 2048 = 2n
+        grad_checkpoint=False,
+        color="#3fb950",
+        label="~50M + 2× averaging",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=2_000_000_000,
     ),
 }
 
