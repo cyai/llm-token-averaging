@@ -120,33 +120,33 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         warmup_steps=500,
         target_tokens=300_000_000,
     ),
-    "avg_8m_k2": ModelConfig(
-        name="avg_8m_k2",
+    "avg_8m_k4": ModelConfig(
+        name="avg_8m_k4",
         d_model=128,
         n_heads=4,
         n_layers=6,
         context_len=512,          # compressed length = n
-        averaging_k=2,            # effective raw context = 1024 = 2n
+        averaging_k=4,            # effective raw context = 1024 = 2n
         grad_checkpoint=False,
         color="#3fb950",
-        label="~8M + 2× averaging",
+        label="~8M + 4× averaging (k=4)",
         lr=4e-4,
         warmup_steps=500,
-        target_tokens=600_000_000,
+        target_tokens=800_000_000,
     ),
-    "model2_8m_ctx2n": ModelConfig(
-        name="model2_8m_ctx2n",
+    "model2_8m_ctx4n": ModelConfig(
+        name="model2_8m_ctx4n",
         d_model=128,
         n_heads=4,
         n_layers=6,
-        context_len=1024,         # true 2n context
+        context_len=2048,         # true 4n context
         averaging_k=1,
         grad_checkpoint=False,
         color="#f78166",
-        label="~8M standard (2n=1024)",
+        label="~8M standard (k=1, 4n=2048)",
         lr=4e-4,
         warmup_steps=500,
-        target_tokens=300_000_000,
+        target_tokens=400_000_000,
     ),
 }
 
