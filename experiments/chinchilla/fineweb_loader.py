@@ -363,14 +363,11 @@ def prepare_dataset(
             if max_train_tokens and total_train >= max_train_tokens:
                 break
 
-    # Clean up temp token files
-    for tok_f in tok_files:
-        tok_f.unlink(missing_ok=True)
-
     print(
         f"[fineweb_loader] Done.\n"
         f"  eval  → {eval_path}  ({eval_token_count/1e6:.1f}M tokens)\n"
-        f"  train → {train_path}  ({total_train/1e6:.1f}M tokens)",
+        f"  train → {train_path}  ({total_train/1e6:.1f}M tokens)\n"
+        f"  .tok.bin files kept in {raw_dir} — future runs skip re-tokenisation.",
         flush=True,
     )
     return train_path, eval_path
