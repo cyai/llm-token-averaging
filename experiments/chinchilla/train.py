@@ -335,7 +335,8 @@ def train_model(
     )
 
     if is_averaged:
-        method_cfg = build_method_config(f"uniform_k{cfg.averaging_k}")
+        _method_name = cfg.method_name or f"uniform_k{cfg.averaging_k}"
+        method_cfg = build_method_config(_method_name)
         model = OLMAveragedLanguageModel(backbone, method_cfg)
     else:
         model = backbone

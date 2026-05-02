@@ -27,7 +27,7 @@ FLOPs estimates on 8× A6000 (~155 TFLOPS BF16 × 8, ~50% MFU → 620 TFLOPS eff
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Dict, Optional
 
 # ---------------------------------------------------------------------------
 # ModelConfig dataclass
@@ -53,7 +53,14 @@ class ModelConfig:
 
     # averaging_k = 1  → standard LM (OLMTransformerBody used directly)
     # averaging_k = 2  → OLMAveragedLanguageModel(uniform_k2) wrapper
+    # For non-uniform schemes set averaging_k to the effective k (for FLOPs/budget
+    # calculations) and set method_name to the exact build_method_config key.
     averaging_k: int = 1
+
+    # Optional override for the averaging method name passed to build_method_config.
+    # When None (default), train.py uses f"uniform_k{averaging_k}".
+    # Example: "mixed_k2k4" for the mixed 2×/4× averaging model.
+    method_name: Optional[str] = None
 
     # Enable gradient checkpointing to fit large models in 24 GB VRAM
     grad_checkpoint: bool = False
@@ -217,6 +224,81 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         lr=2e-4,
         warmup_steps=2000,
         target_tokens=2_000_000_000,
+    ),
+    "avg_50m_k4": ModelConfig(
+        name="avg_50m_k4",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,  # compressed length = n
+        averaging_k=4,  # effective raw context = 4096 = 4n
+        grad_checkpoint=False,
+        color="#f1c40f",  # yellow
+        label="~50M + 4× averaging (k=4)",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=4_072_000_000,  # = 4 × 20N
+    ),
+    "avg_50m_k2_ctx512": ModelConfig(
+        name="avg_50m_k2_ctx512",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=512,  # compressed length = n/2
+        averaging_k=2,  # effective raw context = 1024 = n (same as baseline)
+        grad_checkpoint=False,
+        color="#e67e22",  # orange
+        label="~50M + 2× averaging (ctx=512)",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=2_036_000_000,  # = 2 × 20N
+    ),
+    # Mixed model: first 512 compressed positions use k=2 (1024 raw tokens),
+    # last 512 compressed positions use k=4 (2048 raw tokens).
+    # Effective context = 3072 original tokens per sequence, k_eff = 3.
+    # Train with --seq_len 3072.
+    "avg_50m_mixed_k2k4": ModelConfig(
+        name="avg_50m_mixed_k2k4",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,   # total compressed positions (512 k=2 + 512 k=4)
+        averaging_k=3,      # effective k for FLOPs / budget maths (k_eff = 3072/1024)
+        method_name="mixed_k2k4",  # routes to build_method_config("mixed_k2k4")
+        grad_checkpoint=False,
+        color="#9b59b6",    # purple
+        label="~50M mixed k=2/4 averaging",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=3_054_000_000,  # ≈ 3 × 20N  (k_eff = 3)
+    ),
+    "avg_50m_k8": ModelConfig(
+        name="avg_50m_k8",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,  # compressed length = n
+        averaging_k=8,  # effective raw context = 8192 = 8n
+        grad_checkpoint=False,
+        color="#00c8c8",  # cyan
+        label="~50M + 8× averaging (k=8)",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=8_144_000_000,  # = 8 × 20N
+    ),
+    "avg_50m_k2_wide": ModelConfig(
+        name="avg_50m_k2_wide",
+        d_model=856,  # solved: matches model2_50m_ctx2n FLOPs (+0.57%)
+        n_heads=8,  # head_dim = 107
+        n_layers=8,
+        context_len=1024,  # compressed length
+        averaging_k=2,  # effective raw context = 2048 = 2n
+        grad_checkpoint=False,
+        color="#e040fb",  # purple
+        label="~113M k=2 FLOPs-matched (d=856)",
+        lr=1.55e-4,  # scaled: 2e-4 × √(512/856)
+        warmup_steps=2000,
+        target_tokens=1_000_000_000,  # same token budget as model2_50m_ctx2n
     ),
 }
 

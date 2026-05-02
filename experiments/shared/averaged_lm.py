@@ -258,6 +258,48 @@ def build_method_config(name: str, learnable_checkpoint_dir: Optional[str] = Non
             learnable_module=averager,
         )
 
+    # ---- mixed k2/k4 ----
+    # First 512 compressed positions use k=2 (consumes 1024 raw tokens).
+    # Last  512 compressed positions use k=4 (consumes 2048 raw tokens).
+    # Total: 1024 compressed positions from 3072 raw tokens; effective k_avg = 3.
+    if name == "mixed_k2k4":
+        _n1, _k1 = 512, 2   # k=2 segment → 1024 raw tokens
+        _n2, _k2 = 512, 4   # k=4 segment → 2048 raw tokens
+        _T1 = _n1 * _k1     # = 1024  (boundary between the two segments)
+
+        def _avg_fn(hidden, input_ids, n1=_n1, k1=_k1, n2=_n2, k2=_k2, T1=_T1):
+            B, T, D = hidden.shape
+            T2 = n2 * k2  # = 2048
+
+            # --- k=2 segment: average every 2 of the first T1 tokens ---
+            h1   = hidden[:, :T1]                          # [B, 1024, D]
+            avg1 = h1.reshape(B, n1, k1, D).mean(dim=2)   # [B,  512, D]
+
+            # --- k=4 segment: average every 4 of the next T2 tokens ---
+            h2   = hidden[:, T1:T1 + T2]                   # [B, 2048, D]
+            avg2 = h2.reshape(B, n2, k2, D).mean(dim=2)   # [B,  512, D]
+
+            avg_out = torch.cat([avg1, avg2], dim=1)        # [B, 1024, D]
+
+            # Labels for k=2 positions:
+            #   compressed pos j predicts input_ids[(j+1)*k1]
+            #   last k=2 pos (j=511) predicts input_ids[T1] = first token of k=4 segment
+            labels1 = input_ids[:, k1::k1][:, :n1]         # [B, 512]: 2,4,...,1022,1024
+
+            # Labels for k=4 positions:
+            #   compressed pos j predicts input_ids[T1 + (j+1)*k2]
+            #   last k=4 pos (j=511) has no next group → n2-1 labels
+            labels2 = input_ids[:, T1 + k2::k2][:, :n2 - 1]  # [B, 511]: 1028,...,3068
+
+            labels_out = torch.cat([labels1, labels2], dim=1)  # [B, 1023]
+            return avg_out, labels_out
+
+        return MethodConfig(
+            name=name, method_family="mixed",
+            nominal_k=3, compression_ratio=1.0 - 1.0 / 3.0,
+            avg_fn=_avg_fn,
+        )
+
     raise ValueError(
         f"Unknown method config name: '{name}'. "
         f"Valid names: {get_all_config_names()}"
@@ -268,6 +310,7 @@ def get_all_config_names() -> list:
     return [
         "baseline_k1",
         "uniform_k2", "uniform_k4", "uniform_k8",
+        "mixed_k2k4",
         "dynamic_alt23", "dynamic_rnd24", "dynamic_rnd28",
         "overlap_w2s1", "overlap_w2s2", "overlap_w4s2", "overlap_w4s4",
         "weighted_uniform_k2", "weighted_uniform_k4", "weighted_uniform_k8",
