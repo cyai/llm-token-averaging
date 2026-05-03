@@ -288,7 +288,7 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
     ),
     "avg_50m_k2_wide": ModelConfig(
         name="avg_50m_k2_wide",
-        d_model=856,  # solved: matches model2_50m_ctx2n FLOPs (+0.57%)
+        d_model=864,  # solved: matches model2_50m_ctx2n FLOPs (+0.57%)
         n_heads=8,  # head_dim = 107
         n_layers=8,
         context_len=1024,  # compressed length
@@ -296,9 +296,9 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         grad_checkpoint=False,
         color="#e040fb",  # purple
         label="~113M k=2 FLOPs-matched (d=856)",
-        lr=1.55e-4,  # scaled: 2e-4 × √(512/856)
+        lr=2e-4,
         warmup_steps=2000,
-        target_tokens=1_000_000_000,  # same token budget as model2_50m_ctx2n
+        target_tokens=2_000_000_000,  # same token budget as model2_50m_ctx2n
     ),
 }
 
