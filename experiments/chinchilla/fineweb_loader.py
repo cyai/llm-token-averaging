@@ -18,7 +18,10 @@ Pre-tokenise once (recommended before any multi-GPU run):
 
 How it works
 ------------
-- Lists all parquet shards for sample-10BT on the HF Hub
+- Automatically selects the smallest FineWeb subset that covers the token budget:
+    ≤ 9B tokens  → sample-10BT   (~10B,  ~100 shards)
+    ≤ 90B tokens → sample-100BT  (~100B, ~963 shards)
+    > 90B tokens → sample-350BT  (~350B, ~3600 shards)
 - Downloads exactly the shards needed (in parallel threads)
 - Tokenises each shard in parallel with a multiprocessing pool
 - Splits the result into eval.bin (first EVAL_DOCS docs) and train.bin
@@ -49,8 +52,28 @@ if str(_ROOT) not in sys.path:
 # Constants
 # ---------------------------------------------------------------------------
 
-FINEWEB_REPO   = "HuggingFaceFW/fineweb"
-FINEWEB_SUBSET = "sample-10BT"
+FINEWEB_REPO = "HuggingFaceFW/fineweb"
+
+# Available FineWeb subsets ordered by capacity (tokens).
+# The loader auto-selects the smallest subset that covers the requested budget,
+# with a 10 % headroom so we never run out mid-training.
+_FINEWEB_SUBSETS: list[tuple[str, int]] = [
+    ("sample-10BT",   9_000_000_000),    # ~10B  tokens — use for ≤ 9B  requests
+    ("sample-100BT", 90_000_000_000),    # ~100B tokens — use for ≤ 90B requests
+    ("sample-350BT", 315_000_000_000),   # ~350B tokens — use for ≤ 315B requests
+]
+_FINEWEB_DEFAULT_SUBSET = "sample-350BT"  # fallback when budget > 315B or None
+
+
+def _select_subset(max_train_tokens: Optional[int]) -> str:
+    """Return the smallest FineWeb subset that comfortably covers the token budget."""
+    if max_train_tokens is None:
+        return _FINEWEB_DEFAULT_SUBSET
+    for subset, capacity in _FINEWEB_SUBSETS:
+        if max_train_tokens <= capacity:
+            return subset
+    return _FINEWEB_DEFAULT_SUBSET
+
 
 EVAL_DOCS = 5_000        # first N docs reserved for eval
 DTYPE     = np.uint16    # GPT-NeoX vocab 50 257 fits in uint16
@@ -122,13 +145,15 @@ def _build_local_dataloaders(
 # 2.  DATASET PREPARATION — parallel download + multiprocess tokenisation
 # ---------------------------------------------------------------------------
 
-def _list_shard_paths() -> list[str]:
-    """Return sorted parquet shard paths for sample-10BT on HF Hub."""
+def _list_shard_paths(subset: str) -> list[str]:
+    """Return sorted parquet shard paths for the given FineWeb subset on HF Hub."""
     from huggingface_hub import list_repo_tree
+    # e.g. "sample-10BT" → look for "10BT" anywhere in the path
+    subset_key = subset.replace("sample-", "")   # "10BT", "100BT", "350BT"
     paths = []
     for item in list_repo_tree(FINEWEB_REPO, repo_type="dataset", recursive=True):
         p = item.path if hasattr(item, "path") else str(item)
-        if "10BT" in p and p.endswith(".parquet"):
+        if subset_key in p and p.endswith(".parquet"):
             paths.append(p)
     return sorted(paths)
 
@@ -251,11 +276,18 @@ def prepare_dataset(
     eos_id    = tokenizer.eos_token_id or 0
 
     # ── Step 1: list shards ──────────────────────────────────────────────────
+    subset = _select_subset(max_train_tokens)
+    budget_label = f"{max_train_tokens/1e9:.1f}B" if max_train_tokens else "all"
+    print(
+        f"[fineweb_loader] Subset selected: {subset} "
+        f"(budget: {budget_label} tokens)",
+        flush=True,
+    )
     print("[fineweb_loader] Listing shards on HF Hub …", flush=True)
-    all_shards = _list_shard_paths()
+    all_shards = _list_shard_paths(subset)
     if not all_shards:
         raise RuntimeError(
-            f"No parquet files found for {FINEWEB_REPO}/{FINEWEB_SUBSET}. "
+            f"No parquet files found for {FINEWEB_REPO}/{subset}. "
             "Check your HF credentials and dataset name."
         )
     print(f"  Found {len(all_shards)} shards.", flush=True)
@@ -383,13 +415,14 @@ def _build_olm_dataloaders(
     batch_size: int,
     num_workers: int,
     distributed: bool,
+    subset: str = "sample-10BT",
 ):
     from olm.data.datasets import HuggingFaceTextDataset
     from olm.data.datasets import DataLoader as OLMDataLoader
 
     def _make_hf_dataset(skip=None, take=None, shuffle=False):
         common = dict(
-            name=FINEWEB_SUBSET, tokenizer=tokenizer,
+            name=subset, tokenizer=tokenizer,
             context_length=seq_len, streaming=True, shuffle=shuffle,
         )
         if skip is not None: common["skip"] = skip
@@ -421,9 +454,10 @@ def _doc_stream(
     take: Optional[int] = None,
     rank: int = 0,
     world_size: int = 1,
+    subset: str = "sample-10BT",
 ) -> Iterator[str]:
     from datasets import load_dataset
-    ds      = load_dataset(FINEWEB_REPO, name=FINEWEB_SUBSET,
+    ds      = load_dataset(FINEWEB_REPO, name=subset,
                            split="train", streaming=True)
     yielded = 0
     shard_i = 0
@@ -456,12 +490,13 @@ def _tokenize_and_pack(
 
 
 class _FallbackTrainDataset(IterableDataset):
-    def __init__(self, tokenizer, seq_len, rank=0, world_size=1):
+    def __init__(self, tokenizer, seq_len, rank=0, world_size=1, subset="sample-10BT"):
         super().__init__()
         self.tokenizer  = tokenizer
         self.seq_len    = seq_len
         self.rank       = rank
         self.world_size = world_size
+        self.subset     = subset
 
     def __iter__(self):
         wi = torch.utils.data.get_worker_info()
@@ -473,20 +508,22 @@ class _FallbackTrainDataset(IterableDataset):
             eff_ws   = self.world_size
         while True:
             yield from _tokenize_and_pack(
-                _doc_stream(skip=EVAL_DOCS, rank=eff_rank, world_size=eff_ws),
+                _doc_stream(skip=EVAL_DOCS, rank=eff_rank, world_size=eff_ws,
+                            subset=self.subset),
                 self.tokenizer, self.seq_len,
             )
 
 
 class _FallbackEvalDataset(IterableDataset):
-    def __init__(self, tokenizer, seq_len):
+    def __init__(self, tokenizer, seq_len, subset="sample-10BT"):
         super().__init__()
         self.tokenizer = tokenizer
         self.seq_len   = seq_len
+        self.subset    = subset
 
     def __iter__(self):
         yield from _tokenize_and_pack(
-            _doc_stream(skip=0, take=EVAL_DOCS),
+            _doc_stream(skip=0, take=EVAL_DOCS, subset=self.subset),
             self.tokenizer, self.seq_len,
         )
 
@@ -505,17 +542,23 @@ def build_dataloaders(
     world_size: int = 1,
     distributed: bool = False,
     data_dir: Optional[str | Path] = None,
+    target_tokens: Optional[int] = None,
 ):
     """
-    Build (train_dataloader, eval_dataloader) for FineWeb sample-10BT.
+    Build (train_dataloader, eval_dataloader) for FineWeb.
 
     Priority: local .bin cache → OLM streaming → hand-rolled streaming.
 
     Pass data_dir= to use the fast local binary cache produced by
     prepare_dataset(). With local cache, num_workers=4 is appropriate.
     For streaming fallbacks, num_workers is overridden to 0.
+
+    target_tokens is used to select the appropriate FineWeb subset for
+    streaming fallbacks (default: sample-10BT for ≤9B, sample-100BT for
+    ≤90B, sample-350BT otherwise).
     """
     is_main = (rank == 0)
+    subset  = _select_subset(target_tokens)
 
     # ── 1. Local binary cache ────────────────────────────────────────────────
     if data_dir is not None:
@@ -546,10 +589,13 @@ def build_dataloaders(
     try:
         loaders = _build_olm_dataloaders(
             tokenizer=tokenizer, seq_len=seq_len, batch_size=batch_size,
-            num_workers=num_workers, distributed=distributed,
+            num_workers=num_workers, distributed=distributed, subset=subset,
         )
         if is_main:
-            print("[fineweb_loader] Using OLM HuggingFaceTextDataset.", flush=True)
+            print(
+                f"[fineweb_loader] Using OLM HuggingFaceTextDataset ({subset}).",
+                flush=True,
+            )
         return loaders
     except Exception as e:
         if is_main:
@@ -566,8 +612,10 @@ def build_dataloaders(
             f"for streaming fallback.",
             flush=True,
         )
-    train_ds = _FallbackTrainDataset(tokenizer, seq_len, rank=rank, world_size=world_size)
-    eval_ds  = _FallbackEvalDataset(tokenizer, seq_len)
+    train_ds = _FallbackTrainDataset(
+        tokenizer, seq_len, rank=rank, world_size=world_size, subset=subset,
+    )
+    eval_ds  = _FallbackEvalDataset(tokenizer, seq_len, subset=subset)
     train_dl = DataLoader(train_ds, batch_size=batch_size, num_workers=0, pin_memory=True)
     eval_dl  = DataLoader(eval_ds,  batch_size=batch_size, num_workers=0, pin_memory=True)
     return train_dl, eval_dl

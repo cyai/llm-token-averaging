@@ -286,6 +286,62 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         warmup_steps=2000,
         target_tokens=8_144_000_000,  # = 8 × 20N
     ),
+    "avg_50m_k16": ModelConfig(
+        name="avg_50m_k16",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,  # compressed length = n
+        averaging_k=16,  # effective raw context = 16384 = 16n
+        grad_checkpoint=False,
+        color="#00c8c8",  # cyan
+        label="~50M + 16× averaging (k=16)",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=16_288_000_000,  # = 16 × 20N
+    ),
+    "avg_50m_k32": ModelConfig(
+        name="avg_50m_k32",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,  # compressed length = n
+        averaging_k=32,  # effective raw context = 32768 = 32n
+        grad_checkpoint=False,
+        color="#00c8c8",  # cyan
+        label="~50M + 32× averaging (k=32)",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=32_576_000_000,  # = 32 × 20N
+    ),
+    "avg_50m_k64": ModelConfig(
+        name="avg_50m_k64",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,  # compressed length = n
+        averaging_k=64,  # effective raw context = 65536 = 64n
+        grad_checkpoint=False,
+        color="#00c8c8",  # cyan
+        label="~50M + 64× averaging (k=64)",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=65_152_000_000,  # = 64 × 20N
+    ),
+    "avg_50m_k128": ModelConfig(
+        name="avg_50m_k128",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,  # compressed length = n
+        averaging_k=128,  # effective raw context = 131072 = 128n
+        grad_checkpoint=False,
+        color="#00c8c8",  # cyan
+        label="~50M + 128× averaging (k=128)",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=130_304_000_000,  # = 128 × 20N
+    ),
     "avg_50m_k2_wide": ModelConfig(
         name="avg_50m_k2_wide",
         d_model=864,  # solved: matches model2_50m_ctx2n FLOPs (+0.57%)
