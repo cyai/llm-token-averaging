@@ -550,12 +550,12 @@ def build_dataloaders(
     Priority: local .bin cache → OLM streaming → hand-rolled streaming.
 
     Pass data_dir= to use the fast local binary cache produced by
-    prepare_dataset(). With local cache, num_workers=4 is appropriate.
-    For streaming fallbacks, num_workers is overridden to 0.
+    prepare_dataset(). The cache is only used when it contains at least
+    target_tokens worth of data; otherwise training falls through to
+    HuggingFace streaming so you don't need to pre-download everything.
 
-    target_tokens is used to select the appropriate FineWeb subset for
-    streaming fallbacks (default: sample-10BT for ≤9B, sample-100BT for
-    ≤90B, sample-350BT otherwise).
+    target_tokens also selects the appropriate FineWeb subset for streaming
+    (sample-10BT / sample-100BT / sample-350BT).
     """
     is_main = (rank == 0)
     subset  = _select_subset(target_tokens)
@@ -566,22 +566,30 @@ def build_dataloaders(
         train_path = data_dir / "train.bin"
         eval_path  = data_dir / "eval.bin"
         if train_path.exists() and eval_path.exists():
+            n = len(np.memmap(train_path, dtype=DTYPE, mode="r"))
+            cache_ok = (target_tokens is None) or (n >= target_tokens)
             if is_main:
-                n = len(np.memmap(train_path, dtype=DTYPE, mode="r"))
-                print(
-                    f"[fineweb_loader] Local cache — "
-                    f"{n/1e6:.0f}M train tokens, num_workers={num_workers}",
-                    flush=True,
+                if cache_ok:
+                    print(
+                        f"[fineweb_loader] Local cache — "
+                        f"{n/1e6:.0f}M train tokens, num_workers={num_workers}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[fineweb_loader] Local cache has {n/1e6:.0f}M tokens but "
+                        f"{target_tokens/1e6:.0f}M requested — streaming remainder "
+                        f"from HuggingFace ({subset}).",
+                        flush=True,
+                    )
+            if cache_ok:
+                return _build_local_dataloaders(
+                    data_dir, seq_len, batch_size, num_workers, distributed,
                 )
-            return _build_local_dataloaders(
-                data_dir, seq_len, batch_size, num_workers, distributed,
-            )
         elif is_main:
             print(
-                f"[fineweb_loader] data_dir={data_dir} set but .bin files missing.\n"
-                f"  Run: python -m experiments.chinchilla.fineweb_loader "
-                f"--data_dir {data_dir} --max_train_tokens <N>\n"
-                f"  Falling back to streaming.",
+                f"[fineweb_loader] data_dir={data_dir} set but .bin files missing — "
+                f"falling back to streaming ({subset}).",
                 flush=True,
             )
 
@@ -600,24 +608,24 @@ def build_dataloaders(
     except Exception as e:
         if is_main:
             print(
-                f"[fineweb_loader] OLM unavailable ({e}); "
-                f"hand-rolled streaming (slow — run prepare_dataset() to fix).",
+                f"[fineweb_loader] OLM unavailable ({e}); using hand-rolled "
+                f"streaming ({subset}, num_workers={num_workers}).",
                 flush=True,
             )
 
-    # ── 3. Hand-rolled streaming fallback (num_workers forced to 0) ──────────
-    if is_main and num_workers > 0:
-        print(
-            f"[fineweb_loader] Overriding num_workers={num_workers}→0 "
-            f"for streaming fallback.",
-            flush=True,
-        )
+    # ── 3. Hand-rolled streaming fallback ────────────────────────────────────
+    # num_workers > 0 is safe here: _FallbackTrainDataset.__iter__ shards by
+    # (rank * num_workers + worker_id) so each worker gets a unique doc slice.
     train_ds = _FallbackTrainDataset(
         tokenizer, seq_len, rank=rank, world_size=world_size, subset=subset,
     )
     eval_ds  = _FallbackEvalDataset(tokenizer, seq_len, subset=subset)
-    train_dl = DataLoader(train_ds, batch_size=batch_size, num_workers=0, pin_memory=True)
-    eval_dl  = DataLoader(eval_ds,  batch_size=batch_size, num_workers=0, pin_memory=True)
+    train_dl = DataLoader(
+        train_ds, batch_size=batch_size, num_workers=num_workers, pin_memory=True,
+    )
+    eval_dl  = DataLoader(
+        eval_ds, batch_size=batch_size, num_workers=0, pin_memory=True,
+    )
     return train_dl, eval_dl
 
 
