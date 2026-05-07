@@ -786,14 +786,18 @@ def build_dataloaders(
     """
     Build (train_dataloader, eval_dataloader) for FineWeb.
 
-    Priority: local .bin cache → OLM streaming → hand-rolled streaming.
+    When data_dir is set (strict-local mode), the loader uses **only** local
+    data — it never falls through to HuggingFace streaming. This avoids
+    HF API rate limits (429 errors) that crash multi-GPU training. Local
+    sources are checked in this order:
+        1. {data_dir}/train.bin + eval.bin  (fastest — memmap)
+        2. {data_dir}/raw/**/*.tok.bin       (pre-tokenised shards)
+        3. {data_dir}/raw/**/*.parquet       (raw parquet, tokenise on-the-fly)
+    If none are found, RuntimeError is raised with instructions to run
+    prepare_dataset() first.
 
-    Pass data_dir= to use the fast local binary cache produced by
-    prepare_dataset(). The cache is only used when it contains at least
-    target_tokens worth of data; otherwise training falls through to
-    HuggingFace streaming so you don't need to pre-download everything.
-
-    target_tokens also selects the appropriate FineWeb subset for streaming
+    When data_dir is None, falls back to HF streaming (OLM → hand-rolled).
+    target_tokens selects the FineWeb subset for streaming
     (sample-10BT / sample-100BT / sample-350BT).
     """
     is_main = (rank == 0)
@@ -894,6 +898,25 @@ def build_dataloaders(
                 num_workers=0, pin_memory=True,
             )
             return train_dl, eval_dl
+
+    # ── Strict-local mode: --data_dir set but no local data found ────────────
+    # We refuse to silently fall through to HF streaming because:
+    #   1) HF rate-limits at 500 req / 5 min — multi-GPU training trips this fast
+    #   2) Network reads are 10-100× slower than local memmap
+    # Run prepare_dataset() to download the data first.
+    if data_dir is not None:
+        raise RuntimeError(
+            f"[fineweb_loader] --data_dir={data_dir} is set but no local data found.\n"
+            f"  Looked for:\n"
+            f"    {data_dir}/train.bin + eval.bin   (preferred)\n"
+            f"    {data_dir}/raw/**/*.tok.bin       (pre-tokenised)\n"
+            f"    {data_dir}/raw/**/*.parquet       (raw parquet)\n"
+            f"  Run this first to download data:\n"
+            f"    python -m experiments.chinchilla.fineweb_loader \\\n"
+            f"        --data_dir {data_dir} --tokenizer EleutherAI/pythia-70m \\\n"
+            f"        --max_train_tokens <N> --num_proc 16 --dl_workers 8\n"
+            f"  Or omit --data_dir to use HF streaming (slow + rate-limited)."
+        )
 
     # ── 2. OLM-native streaming ──────────────────────────────────────────────
     try:
