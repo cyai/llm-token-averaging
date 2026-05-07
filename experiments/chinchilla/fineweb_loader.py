@@ -36,6 +36,7 @@ import argparse
 import multiprocessing as mp
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -506,12 +507,42 @@ class _FallbackTrainDataset(IterableDataset):
         else:
             eff_rank = self.rank
             eff_ws   = self.world_size
+
+        retry_delay = 5   # seconds before reconnecting after a network error
         while True:
-            yield from _tokenize_and_pack(
-                _doc_stream(skip=EVAL_DOCS, rank=eff_rank, world_size=eff_ws,
-                            subset=self.subset),
-                self.tokenizer, self.seq_len,
-            )
+            try:
+                yield from _tokenize_and_pack(
+                    _doc_stream(skip=EVAL_DOCS, rank=eff_rank, world_size=eff_ws,
+                                subset=self.subset),
+                    self.tokenizer, self.seq_len,
+                )
+            except Exception as e:
+                # Reconnect on transient network/connection errors so that a
+                # temporary HF outage or TCP reset doesn't crash the worker.
+                # The stream restarts from the beginning (fine since it loops
+                # infinitely and the training step counter is authoritative).
+                err_str = str(e).lower()
+                is_net_err = any(k in err_str for k in (
+                    "client has been closed",
+                    "connection reset",
+                    "connection error",
+                    "connection refused",
+                    "broken pipe",
+                    "errno 104",
+                    "errno 110",
+                    "cannot send a request",
+                    "remote end closed",
+                ))
+                if is_net_err:
+                    print(
+                        f"[fineweb_loader] worker {eff_rank}/{eff_ws} "
+                        f"stream error ({e!r}); reconnecting in {retry_delay}s …",
+                        flush=True,
+                    )
+                    time.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 60)  # exponential backoff, cap 60s
+                    continue
+                raise   # non-network errors bubble up as before
 
 
 class _FallbackEvalDataset(IterableDataset):
@@ -522,10 +553,29 @@ class _FallbackEvalDataset(IterableDataset):
         self.subset    = subset
 
     def __iter__(self):
-        yield from _tokenize_and_pack(
-            _doc_stream(skip=0, take=EVAL_DOCS, subset=self.subset),
-            self.tokenizer, self.seq_len,
-        )
+        retry_delay = 5
+        while True:
+            try:
+                yield from _tokenize_and_pack(
+                    _doc_stream(skip=0, take=EVAL_DOCS, subset=self.subset),
+                    self.tokenizer, self.seq_len,
+                )
+                return  # eval dataset is finite — exit after one pass
+            except Exception as e:
+                err_str = str(e).lower()
+                if any(k in err_str for k in (
+                    "client has been closed", "connection reset", "broken pipe",
+                    "cannot send a request", "errno 104",
+                )):
+                    print(
+                        f"[fineweb_loader] eval stream error ({e!r}); "
+                        f"retrying in {retry_delay}s …",
+                        flush=True,
+                    )
+                    time.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 60)
+                    continue
+                raise
 
 
 # ---------------------------------------------------------------------------
