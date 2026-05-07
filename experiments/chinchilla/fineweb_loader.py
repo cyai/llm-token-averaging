@@ -143,6 +143,193 @@ def _build_local_dataloaders(
 
 
 # ---------------------------------------------------------------------------
+# 1b. LOCAL .tok.bin SHARD STREAMING  (second-fastest — no network needed)
+# ---------------------------------------------------------------------------
+
+def _find_tok_bin_files(data_dir: Path) -> list[Path]:
+    """Return all *.tok.bin shards under data_dir/raw/, sorted by path."""
+    raw_dir = data_dir / "raw"
+    if not raw_dir.exists():
+        return []
+    return sorted(raw_dir.rglob("*.tok.bin"))
+
+
+class _TokBinStreamDataset(IterableDataset):
+    """
+    Infinite streaming dataset backed by local .tok.bin shard files.
+
+    Shards at sequence level: worker slot ``eff_rank`` yields every
+    ``eff_ws``-th sequence so all slots see a balanced, non-overlapping
+    subset of the data regardless of the file/worker ratio.
+    """
+
+    def __init__(
+        self,
+        tok_files: list[Path],
+        seq_len: int,
+        skip_head_tokens: int = 0,   # skip this many tokens at the start of tok_files[0]
+        rank: int = 0,
+        world_size: int = 1,
+    ):
+        super().__init__()
+        self.tok_files         = tok_files
+        self.seq_len           = seq_len
+        self.skip_head_tokens  = skip_head_tokens
+        self.rank              = rank
+        self.world_size        = world_size
+
+    def __iter__(self):
+        wi = torch.utils.data.get_worker_info()
+        if wi is not None:
+            eff_rank = self.rank * wi.num_workers + wi.id
+            eff_ws   = self.world_size * wi.num_workers
+        else:
+            eff_rank = self.rank
+            eff_ws   = self.world_size
+
+        global_seq = 0
+        while True:   # loop forever — training is controlled by step count
+            for file_i, tok_file in enumerate(self.tok_files):
+                data  = np.memmap(tok_file, dtype=DTYPE, mode="r")
+                start = self.skip_head_tokens if file_i == 0 else 0
+                n_seqs = (len(data) - start - 1) // self.seq_len
+                for s in range(n_seqs):
+                    if global_seq % eff_ws == eff_rank:
+                        offset = start + s * self.seq_len
+                        chunk  = np.array(
+                            data[offset : offset + self.seq_len], dtype=np.int64
+                        )
+                        yield torch.from_numpy(chunk)
+                    global_seq += 1
+
+
+def _build_tok_bin_dataloaders(
+    tok_files: list[Path],
+    eval_path: Path | None,
+    seq_len: int,
+    batch_size: int,
+    num_workers: int,
+    distributed: bool,
+    rank: int,
+    world_size: int,
+    skip_head_tokens: int = 0,
+):
+    from torch.utils.data import DistributedSampler
+
+    train_ds = _TokBinStreamDataset(
+        tok_files, seq_len,
+        skip_head_tokens=skip_head_tokens,
+        rank=rank, world_size=world_size,
+    )
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
+    )
+
+    if eval_path is not None and eval_path.exists():
+        eval_ds = _LocalBinDataset(eval_path, seq_len)
+    else:
+        # No eval.bin — use a small slice of the first shard
+        eval_ds = _TokBinStreamDataset(
+            [tok_files[0]], seq_len,
+            skip_head_tokens=0,
+            rank=0, world_size=1,
+        )
+
+    eval_dl = DataLoader(
+        eval_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
+    )
+    return train_dl, eval_dl
+
+
+# ---------------------------------------------------------------------------
+# 1c. LOCAL PARQUET STREAMING  (third priority — tokenise on-the-fly from disk)
+# ---------------------------------------------------------------------------
+
+def _find_local_parquet_files(data_dir: Path) -> list[Path]:
+    """Return all *.parquet files under data_dir/raw/ (excl. .tok.bin), sorted."""
+    raw_dir = data_dir / "raw"
+    if not raw_dir.exists():
+        return []
+    return sorted(p for p in raw_dir.rglob("*.parquet") if not str(p).endswith(".tok.bin"))
+
+
+def _local_parquet_doc_stream(
+    parquet_files: list[Path],
+    skip_docs: int = 0,
+    rank: int = 0,
+    world_size: int = 1,
+) -> Iterator[str]:
+    """Yield text documents from local parquet files, sharded across ranks."""
+    import pyarrow.parquet as pq
+
+    abs_i = 0
+    for pf in parquet_files:
+        pfile = pq.ParquetFile(pf)
+        for batch in pfile.iter_batches(batch_size=1_000, columns=["text"]):
+            for text in batch.column("text").to_pylist():
+                if abs_i >= skip_docs and abs_i % world_size == rank:
+                    if text and text.strip():
+                        yield text
+                abs_i += 1
+
+
+class _LocalParquetStreamDataset(IterableDataset):
+    """
+    Stream and tokenise documents from local parquet files on-the-fly.
+    No network access required — reads directly from downloaded shards.
+    """
+
+    def __init__(
+        self,
+        parquet_files: list[Path],
+        tokenizer_name: str,
+        seq_len: int,
+        skip_docs: int = 0,
+        rank: int = 0,
+        world_size: int = 1,
+    ):
+        super().__init__()
+        self.parquet_files  = parquet_files
+        self.tokenizer_name = tokenizer_name
+        self.seq_len        = seq_len
+        self.skip_docs      = skip_docs
+        self.rank           = rank
+        self.world_size     = world_size
+
+    def __iter__(self):
+        wi = torch.utils.data.get_worker_info()
+        if wi is not None:
+            eff_rank = self.rank * wi.num_workers + wi.id
+            eff_ws   = self.world_size * wi.num_workers
+        else:
+            eff_rank = self.rank
+            eff_ws   = self.world_size
+
+        tok = AutoTokenizer.from_pretrained(self.tokenizer_name, use_fast=True)
+        eos = tok.eos_token_id or 0
+
+        while True:   # loop forever for training
+            yield from _tokenize_and_pack(
+                _local_parquet_doc_stream(
+                    self.parquet_files,
+                    skip_docs=self.skip_docs,
+                    rank=eff_rank,
+                    world_size=eff_ws,
+                ),
+                tok, self.seq_len, eos=eos,
+            )
+
+
+# ---------------------------------------------------------------------------
 # 2.  DATASET PREPARATION — parallel download + multiprocess tokenisation
 # ---------------------------------------------------------------------------
 
@@ -477,9 +664,11 @@ def _tokenize_and_pack(
     text_iter: Iterator[str],
     tokenizer: PreTrainedTokenizerBase,
     seq_len: int,
+    eos: int | None = None,
 ) -> Iterator[torch.Tensor]:
     buf: list[int] = []
-    eos = tokenizer.eos_token_id or 0
+    if eos is None:
+        eos = tokenizer.eos_token_id or 0
     for text in text_iter:
         if not text or not text.strip():
             continue
@@ -610,7 +799,7 @@ def build_dataloaders(
     is_main = (rank == 0)
     subset  = _select_subset(target_tokens)
 
-    # ── 1. Local binary cache ────────────────────────────────────────────────
+    # ── 1. Local binary cache (train.bin / eval.bin) ─────────────────────────
     if data_dir is not None:
         data_dir   = Path(data_dir)
         train_path = data_dir / "train.bin"
@@ -627,9 +816,9 @@ def build_dataloaders(
                     )
                 else:
                     print(
-                        f"[fineweb_loader] Local cache has {n/1e6:.0f}M tokens but "
-                        f"{target_tokens/1e6:.0f}M requested — streaming remainder "
-                        f"from HuggingFace ({subset}).",
+                        f"[fineweb_loader] Local cache has {n/1e6:.0f}M tokens "
+                        f"({target_tokens/1e6:.0f}M requested) — checking for "
+                        f"local .tok.bin shards …",
                         flush=True,
                     )
             if cache_ok:
@@ -638,10 +827,73 @@ def build_dataloaders(
                 )
         elif is_main:
             print(
-                f"[fineweb_loader] data_dir={data_dir} set but .bin files missing — "
-                f"falling back to streaming ({subset}).",
+                f"[fineweb_loader] data_dir={data_dir} — no train.bin, "
+                f"checking for local .tok.bin shards …",
                 flush=True,
             )
+
+    # ── 1b. Local .tok.bin shards (no train.bin needed, no network) ──────────
+    if data_dir is not None:
+        tok_files = _find_tok_bin_files(data_dir)
+        if tok_files:
+            # Estimate total tokens from file sizes (memmap is instant — no I/O)
+            total_tok = sum(
+                len(np.memmap(f, dtype=DTYPE, mode="r")) for f in tok_files
+            )
+            eval_path = data_dir / "eval.bin"
+            # Skip eval tokens at the head of shard 0 so they aren't used for training
+            skip_head = (
+                len(np.memmap(eval_path, dtype=DTYPE, mode="r"))
+                if eval_path.exists() else 0
+            )
+            if is_main:
+                print(
+                    f"[fineweb_loader] Found {len(tok_files)} local .tok.bin shards "
+                    f"({total_tok/1e9:.1f}B tokens) — streaming from disk, "
+                    f"no network required.",
+                    flush=True,
+                )
+            return _build_tok_bin_dataloaders(
+                tok_files, eval_path if eval_path.exists() else None,
+                seq_len, batch_size, num_workers, distributed,
+                rank, world_size, skip_head_tokens=skip_head,
+            )
+
+    # ── 1c. Local parquet files — tokenise on-the-fly, no network ────────────
+    if data_dir is not None:
+        parquet_files = _find_local_parquet_files(data_dir)
+        if parquet_files:
+            eval_path = data_dir / "eval.bin"
+            if is_main:
+                print(
+                    f"[fineweb_loader] Found {len(parquet_files)} local parquet shards "
+                    f"— tokenising on-the-fly from disk, no network required.",
+                    flush=True,
+                )
+            tok_name = getattr(tokenizer, "name_or_path", "EleutherAI/pythia-70m")
+            train_ds = _LocalParquetStreamDataset(
+                parquet_files, tok_name, seq_len,
+                skip_docs=EVAL_DOCS,
+                rank=rank, world_size=world_size,
+            )
+            if eval_path.exists():
+                eval_ds = _LocalBinDataset(eval_path, seq_len)
+            else:
+                eval_ds = _LocalParquetStreamDataset(
+                    parquet_files[:1], tok_name, seq_len,
+                    skip_docs=0,
+                    rank=0, world_size=1,
+                )
+            train_dl = DataLoader(
+                train_ds, batch_size=batch_size,
+                num_workers=num_workers, pin_memory=True,
+                persistent_workers=(num_workers > 0),
+            )
+            eval_dl = DataLoader(
+                eval_ds, batch_size=batch_size,
+                num_workers=0, pin_memory=True,
+            )
+            return train_dl, eval_dl
 
     # ── 2. OLM-native streaming ──────────────────────────────────────────────
     try:
