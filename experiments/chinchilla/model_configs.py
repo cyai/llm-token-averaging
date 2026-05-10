@@ -211,8 +211,8 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         warmup_steps=2000,
         target_tokens=1_000_000_000,
     ),
-    "avg_50m_k2": ModelConfig(
-        name="avg_50m_k2",
+    "avg_50m_k2_v2": ModelConfig(
+        name="avg_50m_k2_v2",
         d_model=512,
         n_heads=8,
         n_layers=8,
@@ -220,7 +220,7 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         averaging_k=2,  # effective raw context = 2048 = 2n
         grad_checkpoint=False,
         color="#3fb950",
-        label="~50M + 2× averaging",
+        label="~50M + 2× averaging (v2)",
         lr=2e-4,
         warmup_steps=2000,
         target_tokens=2_000_000_000,
