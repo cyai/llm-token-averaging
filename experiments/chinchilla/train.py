@@ -430,9 +430,10 @@ def train_model(
 
     # --- training loop ------------------------------------------------------
     ddp_model.train()
-    step     = start_step
-    ema_loss = None
-    EMA_A    = 0.98
+    step       = start_step
+    ema_loss   = None
+    EMA_A      = 0.98
+    early_stop = False   # set to True on all ranks when target eval loss is hit
 
     train_iter = iter(train_dl)
 
@@ -518,6 +519,48 @@ def train_model(
                 flush=True,
             )
 
+            if (
+                args.early_stop_eval_loss is not None
+                and eval_loss_val <= args.early_stop_eval_loss
+            ):
+                print(
+                    f"[{cfg.name}] Early stop: eval_loss={eval_loss_val:.6f} "
+                    f"<= target {args.early_stop_eval_loss:.6f} "
+                    f"at {tokens_seen/1e9:.3f}B tokens / {cumulative_flops:.3e} FLOPs",
+                    flush=True,
+                )
+                early_ckpt = ckpt_dir / f"early_stop_step_{step:08d}.pt"
+                torch.save(
+                    {
+                        "step":             step,
+                        "tokens_seen":      tokens_seen,
+                        "cumulative_flops": cumulative_flops,
+                        "model":            model.state_dict(),
+                        "optimizer":        optimizer.state_dict(),
+                        "scheduler":        scheduler.state_dict(),
+                    },
+                    early_ckpt,
+                )
+                csv_writer.writerow([
+                    step, tokens_seen, f"{cumulative_flops:.6e}",
+                    f"{ema_loss:.6f}", f"{eval_loss_val:.6f}",
+                ])
+                csv_file.flush()
+                csv_file.close()
+                csv_file = None
+                early_stop = True
+
+        # Broadcast early_stop flag so all DDP ranks exit the loop together
+        if world_size > 1:
+            import torch.distributed as dist
+            flag = torch.tensor(int(early_stop), dtype=torch.int32,
+                                device=device)
+            dist.broadcast(flag, src=0)
+            early_stop = bool(flag.item())
+        if early_stop:
+            _cleanup_distributed(world_size)
+            return log_path
+
         # --- checkpoint (rank 0; barrier syncs all ranks) -------------------
         if is_main and step % args.checkpoint_steps == 0:
             ckpt_path = ckpt_dir / f"step_{step:08d}.pt"
@@ -559,8 +602,10 @@ def train_model(
             step, tokens_seen, f"{cumulative_flops:.6e}",
             f"{ema_loss:.6f}", f"{final_eval:.6f}",
         ])
-        csv_file.flush()
-        csv_file.close()
+        if csv_file is not None:
+            csv_file.flush()
+            csv_file.close()
+            csv_file = None
 
         elapsed_total = time.time() - t0
         print(
@@ -588,7 +633,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--model",            required=True,
-                   choices=["model1_50m", "model2_200m","avg_50m_k4", "avg_50m_k2", "avg_50m_k2_ctx512", "avg_50m_mixed_k2k4", "avg_50m_k8", "avg_50m_k2_wide", "model2_50m_ctx2n", "avg_50m_k2", "model1_8m", "avg_8m_k2", "model2_8m_ctx2n", "avg_8m_k4", "model2_8m_ctx4n", "avg_50m_k16", "avg_50m_k32", "avg_50m_k64", "avg_50m_k128", "avg_50m_k2_v2"])
+                   choices=["model1_50m", "model2_200m","avg_50m_k4", "avg_50m_k2", "avg_50m_k2_ctx512", "avg_50m_mixed_k2k4", "avg_50m_k8", "avg_50m_k2_wide", "model2_50m_ctx2n", "avg_50m_k2", "model1_8m", "avg_8m_k2", "model2_8m_ctx2n", "avg_8m_k4", "model2_8m_ctx4n", "avg_50m_k16", "avg_50m_k32", "avg_50m_k64", "avg_50m_k128", "avg_50m_k2_v2", "model1_50m_v2", "model2_50m_ctx2n_v2"])
     p.add_argument("--batch_size",       type=int, default=16,
                    help="Per-GPU batch size.")
     p.add_argument("--seq_len",          type=int, default=1024)
@@ -610,6 +655,9 @@ def parse_args() -> argparse.Namespace:
                    default="EleutherAI/pythia-70m")
     p.add_argument("--resume",           action="store_true")
     p.add_argument("--results_dir",      type=str, default=None)
+    p.add_argument("--early_stop_eval_loss", type=float, default=None,
+                   help="Stop training early when eval loss falls at or below "
+                        "this value (e.g. 4.286754 to match avg_50m_k2_v2).")
     return p.parse_args()
 
 

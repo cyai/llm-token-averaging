@@ -183,8 +183,8 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         warmup_steps=500,
         target_tokens=400_000_000,
     ),
-    "model1_50m": ModelConfig(
-        name="model1_50m",
+    "model1_50m_v2": ModelConfig(
+        name="model1_50m_v2",
         d_model=512,
         n_heads=8,
         n_layers=8,
@@ -192,13 +192,13 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         averaging_k=1,
         grad_checkpoint=False,
         color="#4e9de0",
-        label="~50M standard (n=1024)",
+        label="~50M standard (n=1024) (v2)",
         lr=2e-4,
         warmup_steps=2000,
-        target_tokens=1_000_000_000,
+        target_tokens=20_000_000_000,  # 20B ceiling; early-stop at target eval loss
     ),
-    "model2_50m_ctx2n": ModelConfig(
-        name="model2_50m_ctx2n",
+    "model2_50m_ctx2n_v2": ModelConfig(
+        name="model2_50m_ctx2n_v2",
         d_model=512,
         n_heads=8,
         n_layers=8,
@@ -206,7 +206,7 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         averaging_k=1,
         grad_checkpoint=True,  # 2048 ctx may be tight on VRAM
         color="#f0a500",
-        label="~50M standard (2n=2048)",
+        label="~50M standard (2n=2048) (v2)",
         lr=2e-4,
         warmup_steps=2000,
         target_tokens=1_000_000_000,
