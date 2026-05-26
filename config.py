@@ -21,8 +21,13 @@ NUM_SEQUENCES = 1000
 MAX_SEQUENCE_LENGTH = 512
 BATCH_SIZE = 8
 
-# Device configuration
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# Device configuration — MPS (Apple Silicon) > CUDA > CPU
+if torch.backends.mps.is_available():
+    DEVICE = "mps"
+elif torch.cuda.is_available():
+    DEVICE = "cuda"
+else:
+    DEVICE = "cpu"
 
 # Output paths
 OUTPUT_DIR = "outputs"

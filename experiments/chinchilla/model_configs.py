@@ -197,6 +197,34 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         warmup_steps=2000,
         target_tokens=20_000_000_000,  # 20B ceiling; early-stop at target eval loss
     ),
+    "avg_50m_k2": ModelConfig(
+        name="avg_50m_k2",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,  # compressed length = n
+        averaging_k=2,  # effective raw context = 2048 = 2n
+        grad_checkpoint=False,
+        color="#3fb950",
+        label="~50M + 2× averaging",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=2_000_000_000,
+    ),
+    "model1_50m": ModelConfig(
+        name="model1_50m",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,  # n
+        averaging_k=1,
+        grad_checkpoint=False,
+        color="#4e9de0",
+        label="~50M standard (n=1024)",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=1_000_000_000,
+    ),
     "model2_50m_ctx2n_v2": ModelConfig(
         name="model2_50m_ctx2n_v2",
         d_model=512,
@@ -207,6 +235,20 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         grad_checkpoint=True,  # 2048 ctx may be tight on VRAM
         color="#f0a500",
         label="~50M standard (2n=2048) (v2)",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=1_000_000_000,
+    ),
+    "model2_50m_ctx2n": ModelConfig(
+        name="model2_50m_ctx2n",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=2048,  # true 2n context
+        averaging_k=1,
+        grad_checkpoint=True,  # 2048 ctx may be tight on VRAM
+        color="#f0a500",
+        label="~50M standard (2n=2048)",
         lr=2e-4,
         warmup_steps=2000,
         target_tokens=1_000_000_000,
@@ -262,11 +304,11 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         d_model=512,
         n_heads=8,
         n_layers=8,
-        context_len=1024,   # total compressed positions (512 k=2 + 512 k=4)
-        averaging_k=3,      # effective k for FLOPs / budget maths (k_eff = 3072/1024)
+        context_len=1024,  # total compressed positions (512 k=2 + 512 k=4)
+        averaging_k=3,  # effective k for FLOPs / budget maths (k_eff = 3072/1024)
         method_name="mixed_k2k4",  # routes to build_method_config("mixed_k2k4")
         grad_checkpoint=False,
-        color="#9b59b6",    # purple
+        color="#9b59b6",  # purple
         label="~50M mixed k=2/4 averaging",
         lr=2e-4,
         warmup_steps=2000,
