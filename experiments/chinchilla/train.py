@@ -57,7 +57,11 @@ if str(_ROOT) not in sys.path:
 
 from experiments.chinchilla.fineweb_loader import build_dataloaders, estimate_total_batches
 from experiments.chinchilla.model_configs import get_config, ModelConfig
-from experiments.shared.olm_model import OLMTransformerBody, OLMAveragedLanguageModel
+from experiments.shared.olm_model import (
+    OLMTransformerBody,
+    OLMAveragedLanguageModel,
+    OLMPhasedAveragedLanguageModel,
+)
 from experiments.shared.averaged_lm import build_method_config
 
 
@@ -335,10 +339,17 @@ def train_model(
         context_length=cfg.context_len,
     )
 
+    is_phased = cfg.multi_token_phase_ratio > 0
+
     if is_averaged:
         _method_name = cfg.method_name or f"uniform_k{cfg.averaging_k}"
         method_cfg = build_method_config(_method_name)
-        model = OLMAveragedLanguageModel(backbone, method_cfg)
+        if is_phased:
+            model = OLMPhasedAveragedLanguageModel(
+                backbone, method_cfg, k=cfg.averaging_k,
+            )
+        else:
+            model = OLMAveragedLanguageModel(backbone, method_cfg)
     else:
         model = backbone
 
@@ -361,6 +372,15 @@ def train_model(
             f"GPUs: {world_size} | "
             f"Global batch: {args.batch_size} × {world_size} = "
             f"{args.batch_size * world_size} seqs/step",
+            flush=True,
+        )
+
+    if is_phased and is_main:
+        print(
+            f"[{cfg.name}] Token Superposition Training: "
+            f"k={cfg.averaging_k}, MCE bag loss | "
+            f"Phase 1 = first {cfg.multi_token_phase_ratio:.0%} steps (superposition), "
+            f"Phase 2 = remaining (single-token recovery)",
             flush=True,
         )
 
@@ -428,6 +448,22 @@ def train_model(
         6.0 * n_params * args.batch_size * world_size * effective_seq
     )
 
+    # --- phased training: compute switch step --------------------------------
+    phase_switch_step = 0
+    phase_switched    = False
+    if is_phased:
+        phase_switch_step = int(total_steps * cfg.multi_token_phase_ratio)
+        if is_main:
+            print(
+                f"[{cfg.name}] Phase switch at step {phase_switch_step:,} / {total_steps:,}",
+                flush=True,
+            )
+        # If resuming past the switch point, start in single-token mode
+        if start_step >= phase_switch_step:
+            raw_model = ddp_model.module if world_size > 1 else ddp_model
+            raw_model.set_multi_token(False)
+            phase_switched = True
+
     # --- training loop ------------------------------------------------------
     ddp_model.train()
     step       = start_step
@@ -480,6 +516,18 @@ def train_model(
         step             += 1
         tokens_seen      += tokens_per_global_step
         cumulative_flops += flops_per_global_step
+
+        # --- phase switch (superposition → recovery) -----------------------
+        if is_phased and not phase_switched and step >= phase_switch_step:
+            raw_model = ddp_model.module if world_size > 1 else ddp_model
+            raw_model.set_multi_token(False)
+            phase_switched = True
+            if is_main:
+                print(
+                    f"[{cfg.name}] Phase switch → single-token recovery "
+                    f"at step {step:,} ({tokens_seen/1e9:.3f}B tokens)",
+                    flush=True,
+                )
 
         # Average loss across GPUs for accurate logging
         loss_t = loss.detach().clone()
@@ -633,7 +681,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--model",            required=True,
-                   choices=["model1_50m", "model2_200m","avg_50m_k4", "avg_50m_k2", "avg_50m_k2_ctx512", "avg_50m_mixed_k2k4", "avg_50m_k8", "avg_50m_k2_wide", "model2_50m_ctx2n", "avg_50m_k2", "model1_8m", "avg_8m_k2", "model2_8m_ctx2n", "avg_8m_k4", "model2_8m_ctx4n", "avg_50m_k16", "avg_50m_k32", "avg_50m_k64", "avg_50m_k128", "avg_50m_k2_v2", "model1_50m_v2", "model2_50m_ctx2n_v2"])
+                   choices=["model1_50m", "model2_200m","avg_50m_k4", "avg_50m_k2", "avg_50m_k2_ctx512", "avg_50m_mixed_k2k4", "avg_50m_k8", "avg_50m_k2_wide", "model2_50m_ctx2n", "avg_50m_k2", "model1_8m", "avg_8m_k2", "model2_8m_ctx2n", "avg_8m_k4", "model2_8m_ctx4n", "avg_50m_k16", "avg_50m_k32", "avg_50m_k64", "avg_50m_k128", "avg_50m_k2_v2", "model1_50m_v2", "model2_50m_ctx2n_v2", "avg_50m_k2_phased", "avg_50m_k4_phased", "avg_50m_k8_phased"])
     p.add_argument("--batch_size",       type=int, default=16,
                    help="Per-GPU batch size.")
     p.add_argument("--seq_len",          type=int, default=1024)

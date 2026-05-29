@@ -221,3 +221,95 @@ class OLMAveragedLanguageModel(nn.Module):
     def parameters_to_train(self):
         """All trainable parameters — backbone + optional LearnableAverager."""
         return self.parameters()
+
+
+# ---------------------------------------------------------------------------
+# OLMPhasedAveragedLanguageModel  (Token Superposition Training)
+# ---------------------------------------------------------------------------
+
+class OLMPhasedAveragedLanguageModel(nn.Module):
+    """
+    Token-averaged model with phased training inspired by Token Superposition
+    Training (Peng et al., 2026).
+
+    Phase 1 — superposition (multi_token=True, training mode):
+        Each compressed position predicts ALL k tokens of the next window
+        as a bag, using the backbone's single LM head with multi-hot
+        cross-entropy (MCE) loss:  L_MCE = (1/k) * sum CE(logits, t_i).
+        No extra parameters are added.
+
+    Phase 2 — recovery (multi_token=False):
+        Standard single-token prediction (first token of next window)
+        using the same LM head with ordinary CE loss.
+
+    During eval (self.training=False), always uses single-token prediction
+    regardless of the current phase, keeping eval_loss comparable across
+    all models.
+
+    Parameters
+    ----------
+    backbone      : OLMTransformerBody
+    method_config : MethodConfig (uniform averaging, same as non-phased)
+    k             : averaging window size (== method_config.nominal_k)
+    """
+
+    def __init__(
+        self,
+        backbone: OLMTransformerBody,
+        method_config: MethodConfig,
+        k: int,
+    ) -> None:
+        super().__init__()
+        self.backbone = backbone
+        self.cfg = method_config
+        self.k = k
+        self.multi_token = True
+
+    def set_multi_token(self, enabled: bool) -> None:
+        self.multi_token = enabled
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 1. Embed → [B, T, D]
+        hidden = self.backbone.embed_in(input_ids)
+
+        # 2. Token averaging → [B, T', D] + single-token labels [B, T'-1]
+        hidden_avg, labels_single = self.cfg.avg_fn(hidden, input_ids)
+
+        # 3. Transformer body → [B, T'-1, D]
+        hidden_out = self.backbone.body(hidden_avg[:, :-1])
+
+        # 4. Single LM head → [B, T'-1, V]
+        logits = self.backbone.embed_out(hidden_out)
+
+        if self.multi_token and self.training:
+            # MCE loss: average CE over all k tokens in the next window.
+            # Target i at compressed position j = input_ids[(j+1)*k + i].
+            k = self.k
+            total_loss = 0.0
+
+            for i in range(k):
+                labels_i = input_ids[:, k + i :: k]
+                lbl_len = min(logits.size(1), labels_i.size(1))
+                total_loss += F.cross_entropy(
+                    logits[:, :lbl_len].reshape(-1, logits.size(-1)),
+                    labels_i[:, :lbl_len].reshape(-1),
+                    ignore_index=-100,
+                )
+
+            return total_loss / k, logits
+        else:
+            # Standard single-token CE loss (phase 2 or eval)
+            lbl_len = min(logits.size(1), labels_single.size(1))
+            loss = F.cross_entropy(
+                logits[:, :lbl_len].reshape(-1, logits.size(-1)),
+                labels_single[:, :lbl_len].reshape(-1),
+                ignore_index=-100,
+            )
+            return loss, logits
+
+    def parameters_to_train(self):
+        return self.parameters()

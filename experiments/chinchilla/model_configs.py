@@ -62,6 +62,11 @@ class ModelConfig:
     # Example: "mixed_k2k4" for the mixed 2×/4× averaging model.
     method_name: Optional[str] = None
 
+    # Fraction of training steps that use multi-token prediction (0 = disabled).
+    # E.g. 0.3 means first 30% of steps predict all k next tokens, then
+    # the remaining 70% fall back to standard single-token prediction.
+    multi_token_phase_ratio: float = 0.0
+
     # Enable gradient checkpointing to fit large models in 24 GB VRAM
     grad_checkpoint: bool = False
 
@@ -397,6 +402,57 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         lr=2e-4,
         warmup_steps=2000,
         target_tokens=2_000_000_000,  # same token budget as model2_50m_ctx2n
+    ),
+    # ------------------------------------------------------------------
+    # Phased multi-token prediction experiments
+    # Phase 1 (first 30% steps): predict all k next tokens per position
+    # Phase 2 (remaining 70%):   standard single-token prediction
+    # Token budgets match corresponding non-phased averaged models.
+    # ------------------------------------------------------------------
+    "avg_50m_k2_phased": ModelConfig(
+        name="avg_50m_k2_phased",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,
+        averaging_k=2,
+        multi_token_phase_ratio=0.3,
+        grad_checkpoint=False,
+        color="#2ecc71",  # emerald
+        label="~50M k=2 phased (30% multi-tok)",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=2_000_000_000,
+    ),
+    "avg_50m_k4_phased": ModelConfig(
+        name="avg_50m_k4_phased",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,
+        averaging_k=4,
+        multi_token_phase_ratio=0.3,
+        grad_checkpoint=False,
+        color="#e74c3c",  # crimson
+        label="~50M k=4 phased (30% multi-tok)",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=4_072_000_000,
+    ),
+    "avg_50m_k8_phased": ModelConfig(
+        name="avg_50m_k8_phased",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,
+        averaging_k=8,
+        multi_token_phase_ratio=0.3,
+        grad_checkpoint=False,
+        color="#1abc9c",  # teal
+        label="~50M k=8 phased (30% multi-tok)",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=8_144_000_000,
     ),
 }
 

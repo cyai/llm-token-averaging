@@ -41,6 +41,10 @@ TARGET_MODELS = [
     "avg_50m_k16",
     "avg_50m_k32",
     "avg_50m_k64",
+    # phased (token superposition) models
+    "avg_50m_k2_phased",
+    "avg_50m_k4_phased",
+    "avg_50m_k8_phased",
 ]
 
 COLOR_OVERRIDE = {
@@ -57,6 +61,10 @@ COLOR_OVERRIDE = {
     "avg_50m_k16": "#808080",  # gray         – k=16 (eff=16384)
     "avg_50m_k32": "#58a6ff",  # blue         – k=32 (eff=32768)
     "avg_50m_k64": "#765341",  # brown       – k=64 (eff=65536)
+    # phased (token superposition) models
+    "avg_50m_k2_phased": "#2ecc71",  # emerald     – k=2 phased
+    "avg_50m_k4_phased": "#e74c3c",  # crimson     – k=4 phased
+    "avg_50m_k8_phased": "#1abc9c",  # teal        – k=8 phased
 }
 
 # Chinchilla loss constants (Hoffmann et al. 2022)
