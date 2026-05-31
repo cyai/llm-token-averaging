@@ -416,7 +416,7 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         n_layers=8,
         context_len=1024,
         averaging_k=2,
-        multi_token_phase_ratio=0.3,
+        multi_token_phase_ratio=0.5,
         grad_checkpoint=False,
         color="#2ecc71",  # emerald
         label="~50M k=2 phased (30% multi-tok)",
@@ -431,7 +431,7 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         n_layers=8,
         context_len=1024,
         averaging_k=4,
-        multi_token_phase_ratio=0.3,
+        multi_token_phase_ratio=0.5,
         grad_checkpoint=False,
         color="#e74c3c",  # crimson
         label="~50M k=4 phased (30% multi-tok)",
@@ -446,7 +446,7 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         n_layers=8,
         context_len=1024,
         averaging_k=8,
-        multi_token_phase_ratio=0.3,
+        multi_token_phase_ratio=0.5,
         grad_checkpoint=False,
         color="#1abc9c",  # teal
         label="~50M k=8 phased (30% multi-tok)",
