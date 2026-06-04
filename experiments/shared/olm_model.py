@@ -112,6 +112,13 @@ class OLMTransformerBody(nn.Module):
         self.vocab_size = vocab_size
         self.context_length = context_length
 
+    def tie_embedding_weights(self) -> None:
+        """Make the output LM head share the input embedding weight matrix."""
+        # embed_in: Embedding → self.embedding (nn.Embedding)
+        # embed_out: OutputHead → self.blocks = [LayerNorm, Linear]
+        lm_head = self.embed_out.blocks[1]  # the Linear(d_model, vocab_size)
+        lm_head.weight = self.embed_in.embedding.weight
+
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Standard LM forward without averaging. Returns logits [B, T, vocab]."""
         hidden = self.embed_in(input_ids)

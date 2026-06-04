@@ -67,6 +67,9 @@ class ModelConfig:
     # the remaining 70% fall back to standard single-token prediction.
     multi_token_phase_ratio: float = 0.0
 
+    # Tie input embedding and output LM head weights (reduces params by vocab×d_model)
+    tie_embeddings: bool = True
+
     # Enable gradient checkpointing to fit large models in 24 GB VRAM
     grad_checkpoint: bool = False
 
@@ -89,9 +92,10 @@ class ModelConfig:
 
     @property
     def n_params_approx(self) -> int:
-        """Rough parameter count (embedding + transformer layers)."""
+        """Parameter count: tied shares one embedding matrix, untied has two."""
         vocab = 50_257  # Pythia GPT-NeoX BPE
-        return vocab * self.d_model + self.n_layers * 12 * self.d_model**2
+        embed_factor = 1 if self.tie_embeddings else 2
+        return embed_factor * vocab * self.d_model + self.n_layers * 12 * self.d_model**2
 
     @property
     def flops_per_token(self) -> float:
@@ -229,6 +233,57 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         lr=2e-4,
         warmup_steps=2000,
         target_tokens=1_000_000_000,
+    ),
+    # ------------------------------------------------------------------
+    # Tied-embedding variants  (embed_in and LM head share weights)
+    # Same arch as 50M models but ~51M actual params instead of ~76M.
+    # ------------------------------------------------------------------
+    "model1_50m_tied": ModelConfig(
+        name="model1_50m_tied",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,
+        averaging_k=1,
+        tie_embeddings=True,
+        grad_checkpoint=False,
+        color="#7c3aed",  # violet
+        label="~51M standard tied (n=1024)",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=1_000_000_000,
+    ),
+    "avg_50m_k4_tied": ModelConfig(
+        name="avg_50m_k4_tied",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,
+        averaging_k=4,
+        tie_embeddings=True,
+        grad_checkpoint=False,
+        color="#a855f7",  # purple
+        label="~51M k=4 tied averaging",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=4_072_000_000,
+    ),
+    # ~152M standard baseline  (d=1024, h=16, l=8, ctx=1024)
+    # N = 50257×1024 + 8×12×1024² = 51.5M + 100.7M ≈ 152M
+    # Chinchilla-optimal: D* = 20N ≈ 3B tokens
+    "model1_150m": ModelConfig(
+        name="model1_150m",
+        d_model=1024,
+        n_heads=16,
+        n_layers=8,
+        context_len=1024,
+        averaging_k=1,
+        grad_checkpoint=False,
+        color="#c084fc",  # light purple
+        label="~150M standard (n=1024)",
+        lr=1.5e-4,  # ~2e-4 × sqrt(512/1024)
+        warmup_steps=2000,
+        target_tokens=3_000_000_000,
     ),
     "model2_50m_ctx2n_v2": ModelConfig(
         name="model2_50m_ctx2n_v2",
@@ -432,6 +487,21 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         context_len=1024,
         averaging_k=4,
         multi_token_phase_ratio=0.5,
+        grad_checkpoint=False,
+        color="#e74c3c",  # crimson
+        label="~50M k=4 phased (50% multi-tok)",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=4_072_000_000,
+    ),
+    "avg_50m_k4_phased_30": ModelConfig(
+        name="avg_50m_k4_phased",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,
+        averaging_k=4,
+        multi_token_phase_ratio=0.3,
         grad_checkpoint=False,
         color="#e74c3c",  # crimson
         label="~50M k=4 phased (30% multi-tok)",
