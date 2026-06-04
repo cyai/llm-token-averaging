@@ -29,28 +29,29 @@ PLOTS_DIR = Path(__file__).parent / "plots"
 
 TARGET_MODELS = [
     # standard baselines
-    "model1_50m",
+    # "model1_50m",
     "model2_50m_ctx2n",
     # averaging models
-    "avg_50m_k2_ctx512",
-    "avg_50m_k2",
-    "avg_50m_mixed_k2k4",
+    # "avg_50m_k2_ctx512",
+    # "avg_50m_k2",
+    # "avg_50m_mixed_k2k4",
     "avg_50m_k4",
-    "avg_50m_k8",
-    "avg_50m_k2_wide",
-    "avg_50m_k16",
-    "avg_50m_k32",
-    "avg_50m_k64",
+    # "avg_50m_k8",
+    # "avg_50m_k2_wide",
+    # "avg_50m_k16",
+    # "avg_50m_k32",
+    # "avg_50m_k64",
     # phased (token superposition) models
-    "avg_50m_k2_phased",
+    # "avg_50m_k2_phased",
     "avg_50m_k4_phased",
-    "avg_50m_k8_phased",
+    "avg_50m_k4_phased_30",
+    # "avg_50m_k8_phased",
 ]
 
 COLOR_OVERRIDE = {
     # standard models – warm/neutral
     "model1_50m": "#4e9de0",  # steel blue   – standard (n=1024)
-    "model2_50m_ctx2n": "#f8a500",  # amber        – standard 2n
+    "model2_50m_ctx2n": "#4e9de0",  # amber        – standard 2n
     # averaging models – cool greens → cyan, ordered by effective context
     "avg_50m_k2_ctx512": "#ff7675",  # salmon       – k=2, ctx=512 (eff=1024)
     "avg_50m_k2": "#3fb950",  # green        – k=2, ctx=1024 (eff=2048)
@@ -65,6 +66,7 @@ COLOR_OVERRIDE = {
     "avg_50m_k2_phased": "#2ecc71",  # emerald     – k=2 phased
     "avg_50m_k4_phased": "#e74c3c",  # crimson     – k=4 phased
     "avg_50m_k8_phased": "#1abc9c",  # teal        – k=8 phased
+    "avg_50m_k4_phased_30": "#1abc9c",  # teal     – k=4 phased 30%
 }
 
 # Chinchilla loss constants (Hoffmann et al. 2022)
@@ -97,16 +99,16 @@ def flops_per_sequence(cfg) -> float:
 
 def compute_cumulative_flops(df: pd.DataFrame, cfg) -> np.ndarray:
     """
-    Derive batch_size from the CSV, then compute cumulative FLOPs analytically.
+    Compute cumulative transformer FLOPs from tokens_seen.
 
-    For standard models:   effective_tokens_per_seq = context_len
-    For averaging models:  effective_tokens_per_seq = k * context_len
+    transformer_tokens = tokens_seen / k  (the transformer sees 1/k of raw tokens)
+    transformer_sequences = transformer_tokens / context_len
+    cumulative_flops = transformer_sequences × flops_per_sequence
     """
-    tokens_per_step = df["tokens_seen"].values / df["step"].values
-    effective_tokens_per_seq = cfg.averaging_k * cfg.context_len
-    batch_size = tokens_per_step / effective_tokens_per_seq
+    transformer_tokens = df["tokens_seen"].values / cfg.averaging_k
+    transformer_seqs = transformer_tokens / cfg.context_len
     fps = flops_per_sequence(cfg)
-    return df["step"].values * batch_size * fps
+    return transformer_seqs * fps
 
 
 def ema_smooth(values: np.ndarray, alpha: float = 0.85) -> np.ndarray:

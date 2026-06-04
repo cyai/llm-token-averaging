@@ -301,16 +301,22 @@ def train_model(
         tokenizer.pad_token = tokenizer.eos_token
 
     # --- data  (OLM DataLoader handles DDP sharding via distributed=True) ---
+    # seq_len = post-averaging transformer length.
+    # The dataloader produces k× more raw tokens so that after averaging
+    # the transformer sees exactly seq_len positions.
+    raw_seq_len = args.seq_len * cfg.averaging_k
+
     if is_main:
         print(
             f"[{cfg.name}] Building FineWeb dataloaders "
-            f"(distributed={world_size > 1}) …",
+            f"(distributed={world_size > 1}, "
+            f"raw_seq_len={raw_seq_len}, transformer_L={args.seq_len}) …",
             flush=True,
         )
 
     train_dl, eval_dl = build_dataloaders(
         tokenizer=tokenizer,
-        seq_len=args.seq_len,
+        seq_len=raw_seq_len,
         batch_size=args.batch_size,
         eval_batches=args.eval_batches,
         num_workers=args.num_workers,
@@ -390,8 +396,9 @@ def train_model(
         )
 
     # --- OLM AdamW + cosine-warmup scheduler --------------------------------
+    transformer_tokens = cfg.target_tokens // cfg.averaging_k
     total_steps = estimate_total_batches(
-        cfg.target_tokens, args.seq_len, args.batch_size, world_size
+        transformer_tokens, args.seq_len, args.batch_size, world_size
     )
     optimizer = _build_optimizer(model, lr=cfg.lr)
     scheduler = get_cosine_schedule_with_warmup(
@@ -445,12 +452,12 @@ def train_model(
             csv_file.flush()
 
     # --- FLOPs per global optimizer step ------------------------------------
-    # standard : 6·N · (batch/GPU · GPUs) · seq_len
-    # k=2 avg  : 6·N · (batch/GPU · GPUs) · (seq_len / k)
-    effective_seq          = args.seq_len / cfg.averaging_k
-    tokens_per_global_step = args.batch_size * world_size * args.seq_len
+    # raw tokens per step = batch × GPUs × raw_seq_len  (what the dataloader produces)
+    # transformer tokens per step = raw / k = batch × GPUs × seq_len
+    # FLOPs ≈ 6·N per transformer token
+    tokens_per_global_step = args.batch_size * world_size * raw_seq_len
     flops_per_global_step  = (
-        6.0 * n_params * args.batch_size * world_size * effective_seq
+        6.0 * n_params * args.batch_size * world_size * args.seq_len
     )
 
     # --- phased training: compute switch step --------------------------------
@@ -689,7 +696,9 @@ def parse_args() -> argparse.Namespace:
                    choices=["model1_50m", "model2_200m","avg_50m_k4", "avg_50m_k2", "avg_50m_k2_ctx512", "avg_50m_mixed_k2k4", "avg_50m_k8", "avg_50m_k2_wide", "model2_50m_ctx2n", "avg_50m_k2", "model1_8m", "avg_8m_k2", "model2_8m_ctx2n", "avg_8m_k4", "model2_8m_ctx4n", "avg_50m_k16", "avg_50m_k32", "avg_50m_k64", "avg_50m_k128", "avg_50m_k2_v2", "model1_50m_v2", "model2_50m_ctx2n_v2", "avg_50m_k2_phased", "avg_50m_k4_phased", "avg_50m_k8_phased", "model1_150m", "model1_50m_tied", "avg_50m_k4_tied"])
     p.add_argument("--batch_size",       type=int, default=16,
                    help="Per-GPU batch size.")
-    p.add_argument("--seq_len",          type=int, default=1024)
+    p.add_argument("--seq_len",          type=int, default=1024,
+                   help="Post-averaging transformer sequence length. "
+                        "Dataloader produces k×seq_len raw tokens per sequence.")
     p.add_argument("--device",           type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu",
                    help="Device for single-GPU mode. Ignored by torchrun.")
