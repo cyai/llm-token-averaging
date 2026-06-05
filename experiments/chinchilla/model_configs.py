@@ -268,6 +268,21 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         warmup_steps=2000,
         target_tokens=4_072_000_000,
     ),
+    "model1_50m_tied_2nctx": ModelConfig(
+        name="model1_50m_tied_2ctx",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=2048,
+        averaging_k=1,
+        tie_embeddings=True,
+        grad_checkpoint=False,
+        color="#4e9de0",
+        label="~51M standard tied (2n=2048)",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=1_000_000_000,
+    ),
     # ~152M standard baseline  (d=1024, h=16, l=8, ctx=1024)
     # N = 50257×1024 + 8×12×1024² = 51.5M + 100.7M ≈ 152M
     # Chinchilla-optimal: D* = 20N ≈ 3B tokens
