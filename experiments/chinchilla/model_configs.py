@@ -95,7 +95,9 @@ class ModelConfig:
         """Parameter count: tied shares one embedding matrix, untied has two."""
         vocab = 50_257  # Pythia GPT-NeoX BPE
         embed_factor = 1 if self.tie_embeddings else 2
-        return embed_factor * vocab * self.d_model + self.n_layers * 12 * self.d_model**2
+        return (
+            embed_factor * vocab * self.d_model + self.n_layers * 12 * self.d_model**2
+        )
 
     @property
     def flops_per_token(self) -> float:
