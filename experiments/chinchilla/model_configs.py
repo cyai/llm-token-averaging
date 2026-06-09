@@ -221,6 +221,7 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         lr=2e-4,
         warmup_steps=2000,
         target_tokens=2_000_000_000,
+        tie_embeddings=False,
     ),
     "model1_50m": ModelConfig(
         name="model1_50m",
@@ -235,6 +236,7 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         lr=2e-4,
         warmup_steps=2000,
         target_tokens=1_000_000_000,
+        tie_embeddings=False,
     ),
     # ------------------------------------------------------------------
     # Tied-embedding variants  (embed_in and LM head share weights)
@@ -357,6 +359,7 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         lr=2e-4,
         warmup_steps=2000,
         target_tokens=4_072_000_000,  # = 4 × 20N
+        tie_embeddings=False,
     ),
     "avg_50m_k2_ctx512": ModelConfig(
         name="avg_50m_k2_ctx512",
