@@ -88,10 +88,10 @@ def _setup_distributed() -> tuple[int, int, int]:
     # torch.distributed.timedelta which does not exist in any PyTorch version
     # (the correct call is datetime.timedelta).  Bypass OLM entirely.
     import torch.distributed as _dist
+    torch.cuda.set_device(local_rank)
     if not _dist.is_initialized():
         _dist.init_process_group(backend="nccl")
 
-    torch.cuda.set_device(local_rank)
     return local_rank, global_rank, world_size
 
 
@@ -445,10 +445,18 @@ def train_model(
             csv_file.flush()
 
     # --- FLOPs per global optimizer step ------------------------------------
-    # flops/seq = n_layers × L × (24d² + 4Ld), where L = seq_len / k
+    # Training FLOPs = 3 × forward FLOPs (forward + backward).
+    # Forward FLOPs per token per layer:
+    #   Attention projections (Q,K,V,Out): 4 × 2d² = 8d²
+    #   Attention matmuls (Q@K^T, Attn@V): 2×2×L×d = 4Ld
+    #   SwiGLU FFN (up: d→2h, down: h→d, h=2.5d): 2d×2h + 2h×d = 2d×5d + 2×2.5d×d = 15d²
+    #   Total forward per token per layer: 8d² + 4Ld + 15d² = 23d² + 4Ld
+    # Training (fwd+bwd) per token per layer: 3 × (23d² + 4Ld) = 69d² + 12Ld
     transformer_L          = args.seq_len // cfg.averaging_k
     d                      = cfg.d_model
-    flops_per_seq          = cfg.n_layers * transformer_L * (24 * d * d + 4 * transformer_L * d)
+    fwd_flops_per_token_per_layer = 23 * d * d + 4 * transformer_L * d
+    train_flops_per_token_per_layer = 3 * fwd_flops_per_token_per_layer
+    flops_per_seq          = cfg.n_layers * transformer_L * train_flops_per_token_per_layer
     seqs_per_global_step   = args.batch_size * world_size
     tokens_per_global_step = seqs_per_global_step * args.seq_len
     flops_per_global_step  = seqs_per_global_step * flops_per_seq
@@ -485,6 +493,9 @@ def train_model(
             f"= {cfg.target_tokens/1e9:.1f}B tokens",
             flush=True,
         )
+
+    # Reset peak memory stats for accurate tracking from training start
+    torch.cuda.reset_peak_memory_stats(device)
     t0 = time.time()
 
     while step < total_steps:
@@ -562,13 +573,16 @@ def train_model(
             pct       = 100.0 * tokens_seen / cfg.target_tokens
             eta_h     = ((cfg.target_tokens - tokens_seen) / max(tok_s, 1)) / 3600
             lr_now    = scheduler.get_last_lr()[0]
+            mem_alloc = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+            mem_resrv = torch.cuda.max_memory_reserved(device) / (1024 ** 3)
 
             print(
                 f"[{cfg.name}] step={step:>8,} | "
                 f"tokens={tokens_seen/1e9:.3f}B/{cfg.target_tokens/1e9:.0f}B ({pct:.1f}%) | "
                 f"loss={ema_loss:.4f} | eval={eval_loss_val:.4f} | "
                 f"lr={lr_now:.2e} | flops={cumulative_flops:.2e} | "
-                f"tok/s={tok_s:,.0f} | ETA={eta_h:.1f}h",
+                f"tok/s={tok_s:,.0f} | ETA={eta_h:.1f}h | "
+                f"mem={mem_alloc:.1f}GB/{mem_resrv:.1f}GB",
                 flush=True,
             )
 
@@ -686,7 +700,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--model",            required=True,
-                   choices=["model1_50m", "model2_200m","avg_50m_k4", "avg_50m_k2", "avg_50m_k2_ctx512", "avg_50m_mixed_k2k4", "avg_50m_k8", "avg_50m_k2_wide", "model2_50m_ctx2n", "avg_50m_k2", "model1_8m", "avg_8m_k2", "model2_8m_ctx2n", "avg_8m_k4", "model2_8m_ctx4n", "avg_50m_k16", "avg_50m_k32", "avg_50m_k64", "avg_50m_k128", "avg_50m_k2_v2", "model1_50m_v2", "model2_50m_ctx2n_v2", "avg_50m_k2_phased", "avg_50m_k4_phased", "avg_50m_k8_phased", "model1_150m", "model1_50m_tied", "avg_50m_k4_tied", "model1_50m_tied_2nctx"])
+                   choices=["model1_50m", "model2_200m","avg_50m_k4", "avg_50m_k2", "avg_50m_k2_ctx512", "avg_50m_mixed_k2k4", "avg_50m_k8", "avg_50m_k2_wide", "model2_50m_ctx2n", "avg_50m_k2", "model1_8m", "avg_8m_k2", "model2_8m_ctx2n", "avg_8m_k4", "model2_8m_ctx4n", "avg_50m_k16", "avg_50m_k32", "avg_50m_k64", "avg_50m_k128", "avg_50m_k2_v2", "model1_50m_v2", "model2_50m_ctx2n_v2", "avg_50m_k2_phased", "avg_50m_k4_phased", "avg_50m_k8_phased", "model1_150m", "model1_50m_tied", "avg_50m_k4_tied", "model1_50m_tied_2nctx", "avg_50m_k2_isoflop", "avg_50m_k4_isoflop"])
     p.add_argument("--batch_size",       type=int, default=16,
                    help="Per-GPU batch size.")
     p.add_argument("--seq_len",          type=int, default=1024)

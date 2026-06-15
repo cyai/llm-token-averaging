@@ -221,7 +221,6 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         lr=2e-4,
         warmup_steps=2000,
         target_tokens=2_000_000_000,
-        tie_embeddings=False,
     ),
     "model1_50m": ModelConfig(
         name="model1_50m",
@@ -236,7 +235,6 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         lr=2e-4,
         warmup_steps=2000,
         target_tokens=1_000_000_000,
-        tie_embeddings=False,
     ),
     # ------------------------------------------------------------------
     # Tied-embedding variants  (embed_in and LM head share weights)
@@ -271,6 +269,43 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         lr=2e-4,
         warmup_steps=2000,
         target_tokens=4_072_000_000,
+    ),
+    # ------------------------------------------------------------------
+    # Iso-FLOPs variants: train k=2 and k=4 to match k=1's total FLOPs.
+    # k=1 uses 6.71e16 FLOPs for 1B tokens.
+    # k=2 uses fewer FLOPs/step (transformer sees L/2 positions) → needs
+    #   1B × (flops_per_step_k1 / flops_per_step_k2) = 1B × 2.287 = 2.287B tokens.
+    # k=4 uses even fewer → 1B × 4.923 = 4.923B tokens.
+    # ------------------------------------------------------------------
+    "avg_50m_k2_isoflop": ModelConfig(
+        name="avg_50m_k2_isoflop",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,
+        averaging_k=2,
+        tie_embeddings=True,
+        grad_checkpoint=False,
+        color="#3fb950",
+        label="~51M k=2 tied (iso-FLOPs)",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=2_500_000_000,
+    ),
+    "avg_50m_k4_isoflop": ModelConfig(
+        name="avg_50m_k4_isoflop",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,
+        averaging_k=4,
+        tie_embeddings=True,
+        grad_checkpoint=False,
+        color="#f1c40f",
+        label="~51M k=4 tied (iso-FLOPs)",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=5_500_000_000,
     ),
     "model1_50m_tied_2nctx": ModelConfig(
         name="model1_50m_tied_2ctx",
@@ -359,7 +394,6 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         lr=2e-4,
         warmup_steps=2000,
         target_tokens=4_072_000_000,  # = 4 × 20N
-        tie_embeddings=False,
     ),
     "avg_50m_k2_ctx512": ModelConfig(
         name="avg_50m_k2_ctx512",
