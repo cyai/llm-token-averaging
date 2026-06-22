@@ -339,6 +339,43 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         warmup_steps=2000,
         target_tokens=3_000_000_000,
     ),
+    # ------------------------------------------------------------------
+    # ~125M models  (d=768, h=12, l=12, head_dim=64)
+    # N = 50257×768 + 12×12×768² = 38.6M + 84.9M ≈ 123.5M (tied embeddings)
+    #   model1_125m  : k=1 standard,    target 2.5B tokens
+    #   avg_125m_k2  : k=2 averaging,   target 5B tokens (transformer sees half)
+    # lr ≈ 2e-4 × sqrt(512/768) ≈ 1.6e-4
+    # ------------------------------------------------------------------
+    "model1_125m": ModelConfig(
+        name="model1_125m",
+        d_model=768,
+        n_heads=12,
+        n_layers=12,
+        context_len=1024,  # n
+        averaging_k=1,
+        tie_embeddings=True,
+        grad_checkpoint=False,
+        color="#4e9de0",  # blue
+        label="~125M standard (n=1024)",
+        lr=1.6e-4,
+        warmup_steps=2000,
+        target_tokens=2_500_000_000,  # 2.5B
+    ),
+    "avg_125m_k2": ModelConfig(
+        name="avg_125m_k2",
+        d_model=768,
+        n_heads=12,
+        n_layers=12,
+        context_len=1024,  # compressed length = n
+        averaging_k=2,  # effective raw context = 2048 = 2n
+        tie_embeddings=True,
+        grad_checkpoint=False,
+        color="#3fb950",  # green
+        label="~125M + 2× averaging",
+        lr=1.6e-4,
+        warmup_steps=2000,
+        target_tokens=5_000_000_000,  # 5B
+    ),
     "model2_50m_ctx2n_v2": ModelConfig(
         name="model2_50m_ctx2n_v2",
         d_model=512,
