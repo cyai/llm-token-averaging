@@ -223,6 +223,8 @@ def _eval_loss(
     total_loss = 0.0
     count = 0
 
+    device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+
     for i, batch in enumerate(eval_dl):
         if i >= max_batches:
             break
@@ -232,16 +234,18 @@ def _eval_loss(
         else:
             input_ids = batch.to(device)
 
-        if is_averaged:
-            loss, _ = model(input_ids)
-        else:
-            logits = model(input_ids)
-            labels = input_ids[:, 1:].contiguous()
-            logits = logits[:, :-1].contiguous()
-            loss = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                labels.reshape(-1),
-            )
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16,
+                            enabled=(device_type == "cuda")):
+            if is_averaged:
+                loss, _ = model(input_ids)
+            else:
+                logits = model(input_ids)
+                labels = input_ids[:, 1:].contiguous()
+                logits = logits[:, :-1].contiguous()
+                loss = torch.nn.functional.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    labels.reshape(-1),
+                )
         total_loss += loss.item()
         count += 1
 
@@ -274,6 +278,16 @@ def train_model(
     is_main = _is_main_process()
 
     device = f"cuda:{local_rank}" if world_size > 1 else args.device
+
+    # Enable TF32 tensor cores for any FP32 matmuls (Ampere+, e.g. A6000).
+    # Free ~2× over strict FP32; combined with bf16 autocast below this is the
+    # main throughput fix. No effect on CPU.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+    device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+    use_amp = device_type == "cuda"
 
     if is_main:
         print(
@@ -480,7 +494,8 @@ def train_model(
     # --- training loop ------------------------------------------------------
     ddp_model.train()
     step       = start_step
-    ema_loss   = None
+    ema_loss   = None        # GPU tensor; EMA of the per-step loss (no host sync)
+    ema_val    = float("nan")  # host float, refreshed (all-reduced) at log steps
     EMA_A      = 0.98
     early_stop = False   # set to True on all ranks when target eval loss is hit
 
@@ -513,16 +528,18 @@ def train_model(
 
         optimizer.zero_grad(set_to_none=True)
 
-        if is_averaged:
-            loss, _ = ddp_model(input_ids)
-        else:
-            logits = ddp_model(input_ids)
-            labels = input_ids[:, 1:].contiguous()
-            logits = logits[:, :-1].contiguous()
-            loss = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                labels.reshape(-1),
-            )
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16,
+                            enabled=use_amp):
+            if is_averaged:
+                loss, _ = ddp_model(input_ids)
+            else:
+                logits = ddp_model(input_ids)
+                labels = input_ids[:, 1:].contiguous()
+                logits = logits[:, :-1].contiguous()
+                loss = torch.nn.functional.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    labels.reshape(-1),
+                )
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -545,15 +562,22 @@ def train_model(
                     flush=True,
                 )
 
-        # Average loss across GPUs for accurate logging
-        loss_t = loss.detach().clone()
-        _all_reduce_mean(loss_t, world_size)
-        loss_val = loss_t.item()
-
+        # Update the EMA of the loss entirely on-GPU (no host sync per step).
+        # The cross-rank all-reduce is deferred to logging steps: because both
+        # EMA and all-reduce-mean are linear, mean_r(EMA_r) == EMA(mean_r(loss_r)),
+        # so this is exactly equivalent to averaging the per-step loss across
+        # ranks every step — just without the per-step collective + .item() sync.
+        loss_detached = loss.detach()
         if ema_loss is None:
-            ema_loss = loss_val
+            ema_loss = loss_detached.clone()
         else:
-            ema_loss = EMA_A * ema_loss + (1 - EMA_A) * loss_val
+            ema_loss.mul_(EMA_A).add_(loss_detached, alpha=1 - EMA_A)
+
+        # --- cross-rank loss sync at log steps (collective: ALL ranks) -------
+        if step % args.log_steps == 0:
+            ema_t = ema_loss.clone()
+            _all_reduce_mean(ema_t, world_size)
+            ema_val = ema_t.item()
 
         # --- logging (rank 0) -----------------------------------------------
         if is_main and step % args.log_steps == 0:
@@ -564,7 +588,7 @@ def train_model(
             )
             csv_writer.writerow([
                 step, tokens_seen, f"{cumulative_flops:.6e}",
-                f"{ema_loss:.6f}", f"{eval_loss_val:.6f}",
+                f"{ema_val:.6f}", f"{eval_loss_val:.6f}",
             ])
             csv_file.flush()
 
@@ -579,7 +603,7 @@ def train_model(
             print(
                 f"[{cfg.name}] step={step:>8,} | "
                 f"tokens={tokens_seen/1e9:.3f}B/{cfg.target_tokens/1e9:.0f}B ({pct:.1f}%) | "
-                f"loss={ema_loss:.4f} | eval={eval_loss_val:.4f} | "
+                f"loss={ema_val:.4f} | eval={eval_loss_val:.4f} | "
                 f"lr={lr_now:.2e} | flops={cumulative_flops:.2e} | "
                 f"tok/s={tok_s:,.0f} | ETA={eta_h:.1f}h | "
                 f"mem={mem_alloc:.1f}GB/{mem_resrv:.1f}GB",
@@ -610,15 +634,17 @@ def train_model(
                 )
                 csv_writer.writerow([
                     step, tokens_seen, f"{cumulative_flops:.6e}",
-                    f"{ema_loss:.6f}", f"{eval_loss_val:.6f}",
+                    f"{ema_val:.6f}", f"{eval_loss_val:.6f}",
                 ])
                 csv_file.flush()
                 csv_file.close()
                 csv_file = None
                 early_stop = True
 
-        # Broadcast early_stop flag so all DDP ranks exit the loop together
-        if world_size > 1:
+        # Broadcast early_stop flag so all DDP ranks exit the loop together.
+        # early_stop can only change inside the rank-0 log-step block above,
+        # so we only need this collective (+ host sync) at log steps.
+        if world_size > 1 and step % args.log_steps == 0:
             import torch.distributed as dist
             flag = torch.tensor(int(early_stop), dtype=torch.int32,
                                 device=device)
@@ -644,7 +670,9 @@ def train_model(
             )
             print(f"[{cfg.name}] Checkpoint → {ckpt_path}", flush=True)
 
-        _barrier(world_size)   # keep all ranks in step-lock
+        # No per-step barrier: DDP's backward all-reduce already keeps ranks in
+        # lock-step every step. Rank-0-only checkpointing is fine — other ranks
+        # naturally wait at the next gradient all-reduce.
 
     # --- final checkpoint + eval (rank 0) -----------------------------------
     if is_main:
@@ -667,7 +695,7 @@ def train_model(
         )
         csv_writer.writerow([
             step, tokens_seen, f"{cumulative_flops:.6e}",
-            f"{ema_loss:.6f}", f"{final_eval:.6f}",
+            f"{ema_val:.6f}", f"{final_eval:.6f}",
         ])
         if csv_file is not None:
             csv_file.flush()
