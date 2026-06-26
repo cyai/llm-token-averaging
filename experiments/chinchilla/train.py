@@ -45,11 +45,14 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import math
+
 import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.checkpoint import checkpoint as gradient_checkpoint
-from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
+from transformers import AutoTokenizer
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_ROOT) not in sys.path:
@@ -63,6 +66,42 @@ from experiments.shared.olm_model import (
     OLMPhasedAveragedLanguageModel,
 )
 from experiments.shared.averaged_lm import build_method_config
+
+
+# ---------------------------------------------------------------------------
+# Cosine LR schedule with min_lr  (Chinchilla / LLaMA standard: decay to 10%)
+# ---------------------------------------------------------------------------
+
+MIN_LR_RATIO = 0.1  # η_min = 0.1 × η_max (Chinchilla 10× decay, LLaMA convention)
+
+
+def get_cosine_schedule_with_warmup_and_min_lr(
+    optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    min_lr_ratio: float = MIN_LR_RATIO,
+) -> LambdaLR:
+    """
+    Cosine decay from peak LR to min_lr = min_lr_ratio × peak_lr.
+
+    Matches the schedule used by Chinchilla (Hoffmann et al., 2022) and
+    LLaMA (Touvron et al., 2023): 10× decay over the full cosine cycle,
+    with the cycle length exactly matched to training duration.
+
+    Chinchilla Appendix Figure A1 explicitly shows that overshooting the
+    cycle length beyond ~25% hurts final loss — so we keep the cycle
+    matched to num_training_steps and decay to a floor instead.
+    """
+    def lr_lambda(current_step: int) -> float:
+        if current_step < num_warmup_steps:
+            return current_step / max(1, num_warmup_steps)
+        progress = (current_step - num_warmup_steps) / max(
+            1, num_training_steps - num_warmup_steps
+        )
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
+
+    return LambdaLR(optimizer, lr_lambda)
 
 
 # ---------------------------------------------------------------------------
@@ -404,14 +443,17 @@ def train_model(
         )
 
     # --- OLM AdamW + cosine-warmup scheduler --------------------------------
+    # Cosine decay to 10% of peak LR (Chinchilla/LLaMA convention).
+    # Cycle length = total training steps (Chinchilla Fig A1: overshooting hurts).
     total_steps = estimate_total_batches(
         cfg.target_tokens, args.seq_len, args.batch_size, world_size
     )
     optimizer = _build_optimizer(model, lr=cfg.lr)
-    scheduler = get_cosine_schedule_with_warmup(
+    scheduler = get_cosine_schedule_with_warmup_and_min_lr(
         optimizer,
         num_warmup_steps=cfg.warmup_steps,
         num_training_steps=total_steps,
+        min_lr_ratio=MIN_LR_RATIO,
     )
 
     # --- resume -------------------------------------------------------------
