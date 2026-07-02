@@ -346,10 +346,13 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
     #   avg_125m_k2  : k=2 averaging,   target 5B tokens (transformer sees half)
     # lr ≈ 2e-4 × sqrt(512/768) ≈ 1.6e-4
     # ------------------------------------------------------------------
+    # d_model=512,
+    #     n_heads=8,
+    #     n_layers=8,
     "model1_125m": ModelConfig(
         name="model1_125m",
         d_model=768,
-        n_heads=12,
+        n_heads=12, 
         n_layers=12,
         context_len=1024,  # n
         averaging_k=1,
@@ -375,6 +378,43 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         lr=1.6e-4,
         warmup_steps=2000,
         target_tokens=5_000_000_000,  # 5B
+    ),
+    # ------------------------------------------------------------------
+    # ~250M models  (d=1024, h=16, l=16, head_dim=64)
+    # N = 50257×1024 + 16×12×1024² = 51.5M + 201.3M ≈ 253M (tied embeddings)
+    #   model1_250m  : k=1 standard,    target 5B raw tokens
+    #   avg_250m_k2  : k=2 averaging,   target 10B raw tokens (transformer sees 5B)
+    # lr ≈ 2e-4 × sqrt(512/1024) ≈ 1.4e-4
+    # ------------------------------------------------------------------
+    "model1_250m": ModelConfig(
+        name="model1_250m",
+        d_model=1024,
+        n_heads=16,
+        n_layers=16,
+        context_len=1024,  # n
+        averaging_k=1,
+        tie_embeddings=True,
+        grad_checkpoint=True,
+        color="#4e9de0",  # blue
+        label="~250M standard (n=1024)",
+        lr=1.4e-4,
+        warmup_steps=2000,
+        target_tokens=5_000_000_000,  # 5B
+    ),
+    "avg_250m_k2": ModelConfig(
+        name="avg_250m_k2",
+        d_model=1024,
+        n_heads=16,
+        n_layers=16,
+        context_len=1024,  # compressed length = n
+        averaging_k=2,  # effective raw context = 2048 = 2n
+        tie_embeddings=True,
+        grad_checkpoint=True,
+        color="#3fb950",  # green
+        label="~250M + 2× averaging",
+        lr=1.4e-4,
+        warmup_steps=2000,
+        target_tokens=10_000_000_000,  # 10B
     ),
     "model2_50m_ctx2n_v2": ModelConfig(
         name="model2_50m_ctx2n_v2",
