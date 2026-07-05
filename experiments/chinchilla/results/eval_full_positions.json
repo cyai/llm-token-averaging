@@ -1,0 +1,26 @@
+{
+  "model1_125m": {
+    "all_covered": {
+      "mean_nll": 4.178616170054497,
+      "ppl": 65.2754605473835,
+      "n_predictions": 3415797,
+      "n_positions": 1023
+    },
+    "restricted_to_avg_125m_k2": {
+      "mean_nll": 4.1764726881881495,
+      "ppl": 65.13569362882389,
+      "n_predictions": 3409119,
+      "n_positions": 1021
+    }
+  },
+  "avg_125m_k2": {
+    "all_covered": {
+      "mean_nll": 4.14144448717809,
+      "ppl": 62.89360487149235,
+      "n_predictions": 3409119,
+      "n_positions": 1021
+    },
+    "offset_0": 4.145140844270098,
+    "offset_1": 4.137740893330602
+  }
+}
