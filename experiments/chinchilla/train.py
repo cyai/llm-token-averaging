@@ -59,7 +59,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from experiments.chinchilla.fineweb_loader import build_dataloaders, estimate_total_batches
-from experiments.chinchilla.model_configs import get_config, ModelConfig
+from experiments.chinchilla.model_configs import get_config, ModelConfig, MODEL_CONFIGS
 from experiments.shared.olm_model import (
     OLMTransformerBody,
     OLMAveragedLanguageModel,
@@ -770,7 +770,8 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--model",            required=True,
-                   choices=["model1_50m", "model2_200m","avg_50m_k4", "avg_50m_k2", "avg_50m_k2_ctx512", "avg_50m_mixed_k2k4", "avg_50m_k8", "avg_50m_k2_wide", "model2_50m_ctx2n", "avg_50m_k2", "model1_8m", "avg_8m_k2", "model2_8m_ctx2n", "avg_8m_k4", "model2_8m_ctx4n", "avg_50m_k16", "avg_50m_k32", "avg_50m_k64", "avg_50m_k128", "avg_50m_k2_v2", "model1_50m_v2", "model2_50m_ctx2n_v2", "avg_50m_k2_phased", "avg_50m_k4_phased", "avg_50m_k8_phased", "model1_150m", "model1_50m_tied", "avg_50m_k4_tied", "model1_50m_tied_2nctx", "avg_50m_k2_isoflop", "avg_50m_k4_isoflop", "model1_125m", "avg_125m_k2", "model1_250m", "avg_250m_k2"])
+                   choices=list(MODEL_CONFIGS.keys()),
+                   help="Any config name from model_configs.py")
     p.add_argument("--batch_size",       type=int, default=16,
                    help="Per-GPU batch size.")
     p.add_argument("--seq_len",          type=int, default=1024)

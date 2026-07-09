@@ -95,6 +95,67 @@ def _dynamic_labels(input_ids: torch.Tensor, groups: list) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Word-boundary averaging helpers
+# ---------------------------------------------------------------------------
+
+_WORD_START_TABLE: Optional[torch.Tensor] = None
+_WORD_START_TOKENIZER = "EleutherAI/pythia-70m"
+
+
+def _get_word_start_table() -> torch.Tensor:
+    """
+    Boolean lookup table [vocab_size]: True if the token begins a new word.
+
+    For the GPT-NeoX BPE used by Pythia, a token starts a new word iff its
+    string form begins with 'Ġ' (leading space) or 'Ċ' (newline).  Special
+    tokens (EOS etc.) also count as boundaries.  Built once and cached.
+    """
+    global _WORD_START_TABLE
+    if _WORD_START_TABLE is None:
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(_WORD_START_TOKENIZER, use_fast=True)
+        vocab = tok.get_vocab()
+        # Pad to the model's padded vocab (50304 > tokenizer's 50277) so any
+        # valid model input id can index the table; padded ids never occur in
+        # real tokenized data, treat them as boundaries.
+        vocab_size = max(max(vocab.values()) + 1, 50304)
+        table = torch.ones(vocab_size, dtype=torch.bool)
+        table[: max(vocab.values()) + 1] = False
+        for tok_str, tok_id in vocab.items():
+            if tok_str and tok_str[0] in ("Ġ", "Ċ"):
+                table[tok_id] = True
+        for tok_id in tok.all_special_ids:
+            if 0 <= tok_id < vocab_size:
+                table[tok_id] = True
+        _WORD_START_TABLE = table
+    return _WORD_START_TABLE
+
+
+def _word_group_sizes(word_start_row: np.ndarray, k: int) -> list:
+    """
+    Greedy word-aligned grouping for one sequence.
+
+    Walk the sequence left to right accumulating tokens into the current
+    group; close the group when it has >= k tokens AND the next token starts
+    a new word (so no group ends mid-word), or force-close at 2k tokens so
+    a single very long word cannot blow up the window.  A trailing partial
+    group (< k tokens) is dropped.
+
+    Returns a list of group sizes; sum(sizes) <= len(word_start_row).
+    """
+    sizes = []
+    cur = 0
+    T = len(word_start_row)
+    for t in range(T):
+        cur += 1
+        if cur >= 2 * k or (cur >= k and (t + 1 == T or word_start_row[t + 1])):
+            sizes.append(cur)
+            cur = 0
+    return sizes
+
+
+# ---------------------------------------------------------------------------
 # Method registry
 # ---------------------------------------------------------------------------
 
@@ -300,6 +361,49 @@ def build_method_config(name: str, learnable_checkpoint_dir: Optional[str] = Non
             avg_fn=_avg_fn,
         )
 
+    # ---- word-boundary windows (variable size, >= k tokens, end at word starts) ----
+    if name.startswith("word_k"):
+        k = int(name.split("_k")[1])
+
+        def _avg_fn(hidden, input_ids, _k=k):
+            B, T, D = hidden.shape
+            table = _get_word_start_table().to(input_ids.device)
+            ws_np = table[input_ids].cpu().numpy()          # [B, T] bool
+
+            avg_list, lbl_list = [], []
+            for i in range(B):
+                sizes = _word_group_sizes(ws_np[i], _k)
+                n = len(sizes)
+                sizes_t = torch.tensor(sizes, device=hidden.device)
+                gid = torch.repeat_interleave(
+                    torch.arange(n, device=hidden.device), sizes_t
+                )                                            # [sum(sizes)]
+                covered = int(gid.size(0))
+                sums = torch.zeros(n, D, device=hidden.device, dtype=hidden.dtype)
+                sums.index_add_(0, gid, hidden[i, :covered])
+                avg_list.append(sums / sizes_t.to(hidden.dtype).unsqueeze(1))
+                # Label at group j = first token of group j+1
+                starts = np.cumsum([0] + sizes[:-1])
+                lbl_pos = torch.as_tensor(
+                    starts[1:], dtype=torch.long, device=input_ids.device
+                )
+                lbl_list.append(input_ids[i, lbl_pos])
+
+            # Group count varies per sequence → truncate batch to the minimum
+            G = min(a.size(0) for a in avg_list)
+            avg = torch.stack([a[:G] for a in avg_list], dim=0)        # [B, G, D]
+            labels = torch.stack([l[: G - 1] for l in lbl_list], dim=0)  # [B, G-1]
+            return avg, labels
+
+        return MethodConfig(
+            name=name, method_family="word",
+            nominal_k=k,
+            # Nominal; realized compression is higher (mean group size > k
+            # because groups extend past k tokens to the next word start).
+            compression_ratio=1.0 - 1.0 / k,
+            avg_fn=_avg_fn,
+        )
+
     raise ValueError(
         f"Unknown method config name: '{name}'. "
         f"Valid names: {get_all_config_names()}"
@@ -319,6 +423,7 @@ def get_all_config_names() -> list:
         "weighted_gaussian_k2", "weighted_gaussian_k4", "weighted_gaussian_k8",
         "weighted_triangular_k2", "weighted_triangular_k4", "weighted_triangular_k8",
         "learnable_k2", "learnable_k4", "learnable_k8",
+        "word_k2", "word_k4",
     ]
 
 

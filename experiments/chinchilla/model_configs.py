@@ -655,6 +655,127 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         warmup_steps=2000,
         target_tokens=8_144_000_000,
     ),
+    # ==================================================================
+    # POOLING ABLATIONS  (all Config A: seq_len 1024, transformer L = 1024/k)
+    #
+    # Each run changes exactly ONE thing vs avg_50m_k2 (uniform mean pooling)
+    # and keeps everything else identical: same architecture, same raw
+    # context (1024), same batch/LR/schedule, same 2B-token budget so the
+    # endpoint is iso-FLOPs with the clean k=1 baseline (loss_log_1x_ctx).
+    #
+    # Train exactly like avg_50m_k2, e.g.:
+    #   torchrun --standalone --nproc_per_node=8 experiments/chinchilla/train.py \
+    #       --model avg_50m_k2_learnable --batch_size 2 --seq_len 1024
+    # ==================================================================
+    # (1) Learned pooling: a small trainable module decides how to combine
+    #     the k embeddings, instead of fixed equal weights (0.5/0.5).
+    #     Question: is plain mean already good enough?
+    "avg_50m_k2_learnable": ModelConfig(
+        name="avg_50m_k2_learnable",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,
+        averaging_k=2,
+        method_name="learnable_k2",
+        grad_checkpoint=False,
+        color="#e67e22",  # orange
+        label="~50M k=2 learnable pooling",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=2_000_000_000,
+    ),
+    # (2) Same question at k=4, where compression is harsher and a learned
+    #     combiner has more room to help (or fail).
+    "avg_50m_k4_learnable": ModelConfig(
+        name="avg_50m_k4_learnable",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,
+        averaging_k=4,
+        method_name="learnable_k4",
+        grad_checkpoint=False,
+        color="#d35400",  # dark orange
+        label="~50M k=4 learnable pooling",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=4_072_000_000,
+    ),
+    # (3) Fixed but UNEQUAL weights: exponential weighting gives the later
+    #     token in each window more weight than the earlier one.
+    #     Question: does emphasising the most recent token matter, or is
+    #     any reasonable fixed weighting equivalent?  (Robustness check.)
+    "avg_50m_k2_wexp": ModelConfig(
+        name="avg_50m_k2_wexp",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,
+        averaging_k=2,
+        method_name="weighted_exponential_k2",
+        grad_checkpoint=False,
+        color="#8e44ad",  # purple
+        label="~50M k=2 exponential weights",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=2_000_000_000,
+    ),
+    "avg_50m_k4_wexp": ModelConfig(
+        name="avg_50m_k4_wexp",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,
+        averaging_k=4,
+        method_name="weighted_exponential_k4",
+        grad_checkpoint=False,
+        color="#8e44ad",  # purple
+        label="~50M k=4 exponential weights",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=4_072_000_000,
+    ),
+    # (4) Overlapping windows: each output position averages 4 tokens but
+    #     windows slide by 2 → same 2x compression as k=2, but neighbouring
+    #     windows share tokens, so no token sits on a hard boundary.
+    #     Question: do hard window cuts (token 2 vs token 3) cost us anything?
+    "avg_50m_k2_ov4s2": ModelConfig(
+        name="avg_50m_k2_ov4s2",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,
+        averaging_k=2,  # effective compression = stride 2 → 2x
+        method_name="overlap_w4_s2",
+        grad_checkpoint=False,
+        color="#16a085",  # teal
+        label="~50M k=2 overlap (w=4, s=2)",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=2_000_000_000,
+    ),
+    # (5) Word-boundary windows: windows break at word starts instead of
+    #     every fixed 2 tokens, so no window blends two different words
+    #     together.  Groups are >=2 tokens (force-close at 4) and end at
+    #     the next word start, so mean compression is slightly above 2x.
+    #     Question: is word-blending the main source of the averaged model's
+    #     per-token handicap?  Highest-upside ablation of the set.
+    "avg_50m_k2_word": ModelConfig(
+        name="avg_50m_k2_word",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,
+        averaging_k=2,  # nominal; iso-FLOPs analysis must use realized ratio
+        method_name="word_k2",
+        grad_checkpoint=False,
+        color="#c0392b",  # red
+        label="~50M k=2 word-boundary windows",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=2_000_000_000,
+    ),
 }
 
 # Ordered list for sequential training (smallest to largest)
