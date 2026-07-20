@@ -482,6 +482,19 @@ class AveragedLanguageModel(nn.Module):
             loss:   scalar cross-entropy loss
             logits: [B, T'-1, vocab_size]
         """
+        k = self.cfg.nominal_k
+
+        # Random offset during training so all token positions are trained on
+        if self.training and k > 1:
+            offset = torch.randint(k, (1,)).item()
+        else:
+            offset = 0
+
+        if offset > 0:
+            input_ids = input_ids[:, offset:]
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, offset:]
+
         # 1. Manual embedding lookup
         hidden = self.model.gpt_neox.embed_in(input_ids)          # [B, T, D]
 

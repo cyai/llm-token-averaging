@@ -198,6 +198,19 @@ class OLMAveragedLanguageModel(nn.Module):
         loss   : scalar cross-entropy
         logits : [B, T'-1, vocab_size]
         """
+        k = self.cfg.nominal_k
+
+        # Random offset during training: sample offset ∈ {0, ..., k-1} so
+        # that over many steps every token position is trained on uniformly.
+        # At eval time offset = 0 for deterministic behaviour.
+        if self.training and k > 1:
+            offset = torch.randint(k, (1,)).item()
+        else:
+            offset = 0
+
+        if offset > 0:
+            input_ids = input_ids[:, offset:]
+
         # 1. OLM embedding lookup → [B, T, D]
         hidden = self.backbone.embed_in(input_ids)
 
@@ -280,6 +293,17 @@ class OLMPhasedAveragedLanguageModel(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        k = self.k
+
+        # Random offset (same idea as OLMAveragedLanguageModel)
+        if self.training and k > 1:
+            offset = torch.randint(k, (1,)).item()
+        else:
+            offset = 0
+
+        if offset > 0:
+            input_ids = input_ids[:, offset:]
+
         # 1. Embed → [B, T, D]
         hidden = self.backbone.embed_in(input_ids)
 
@@ -295,7 +319,6 @@ class OLMPhasedAveragedLanguageModel(nn.Module):
         if self.multi_token and self.training:
             # MCE loss: average CE over all k tokens in the next window.
             # Target i at compressed position j = input_ids[(j+1)*k + i].
-            k = self.k
             total_loss = 0.0
 
             for i in range(k):
