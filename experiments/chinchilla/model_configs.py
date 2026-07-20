@@ -776,6 +776,44 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         warmup_steps=2000,
         target_tokens=2_000_000_000,
     ),
+    # ==================================================================
+    # POSITION-AWARE LEARNABLE POOLING FOLLOW-UPS
+    #
+    # Mean controls reuse the original avg_50m_k2 / avg_50m_k4 configs and
+    # select a separate output root with train.py --results_dir.
+    # ==================================================================
+    "avg_50m_k2_learnable_pos": ModelConfig(
+        name="avg_50m_k2_learnable_pos",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,
+        averaging_k=2,
+        method_name="learnable_pos_k2",
+        tie_embeddings=True,
+        grad_checkpoint=False,
+        color="#2980b9",
+        label="~50M k=2 learnable content + position",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=2_000_000_000,
+    ),
+    "avg_50m_k4_learnable_pos": ModelConfig(
+        name="avg_50m_k4_learnable_pos",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,
+        averaging_k=4,
+        method_name="learnable_pos_k4",
+        tie_embeddings=True,
+        grad_checkpoint=False,
+        color="#2471a3",
+        label="~50M k=4 learnable content + position",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=4_072_000_000,
+    ),
 }
 
 # Ordered list for sequential training (smallest to largest)

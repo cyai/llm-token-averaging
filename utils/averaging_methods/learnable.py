@@ -93,6 +93,43 @@ class LearnableAverager(nn.Module):
         return stacked.mean(axis=(0, 1))               # [k]
 
 
+class PositionalLearnableAverager(LearnableAverager):
+    """
+    Content-dependent pooling with an explicit learned position bias.
+
+    score(e_i, i) = content_scorer(e_i) + position_logits[i]
+
+    The content scorer is zero-initialised as in LearnableAverager. For k=2,
+    position logits start uniform because fixed recency weighting hurt in the
+    first sweep. For k>=4, they start at the successful exponential recency
+    rule (last/first ratio = 20). Both terms are then trained end-to-end.
+    """
+
+    def __init__(self, hidden_dim: int, k: int):
+        super().__init__(hidden_dim=hidden_dim, k=k)
+        if k == 2:
+            initial_logits = torch.zeros(k)
+        else:
+            initial_logits = torch.linspace(0.0, float(np.log(20.0)), steps=k)
+        self.position_logits = nn.Parameter(initial_logits)
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, hidden_dim = x.shape
+        n_windows = seq_len // self.k
+        truncated_len = n_windows * self.k
+
+        x_trunc = x[:, :truncated_len, :]
+        x_windows = x_trunc.reshape(batch_size, n_windows, self.k, hidden_dim)
+
+        content_scores = self.scorer(x_windows).squeeze(-1)             # [B, N, k]
+        scores = content_scores + self.position_logits.view(1, 1, self.k)
+        weights = F.softmax(scores, dim=2)
+        averaged = (x_windows * weights.unsqueeze(-1)).sum(dim=2)
+        return averaged, weights
+
+
 class ReconstructionDecoder(nn.Module):
     """
     Decodes a single averaged embedding back to k original-token embeddings.

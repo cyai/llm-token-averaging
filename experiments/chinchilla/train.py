@@ -411,6 +411,32 @@ def train_model(
     else:
         model = backbone
 
+    if is_averaged and is_main:
+        pooling_params = 0
+        if method_cfg.learnable_module is not None:
+            pooling_params = sum(
+                p.numel() for p in method_cfg.learnable_module.parameters()
+                if p.requires_grad
+            )
+        print(
+            f"[{cfg.name}] Pooling: method={method_cfg.name}, "
+            f"family={method_cfg.method_family}, k={method_cfg.nominal_k}, "
+            f"trainable_pooling_params={pooling_params:,}",
+            flush=True,
+        )
+        if (
+            method_cfg.learnable_module is not None
+            and hasattr(method_cfg.learnable_module, "position_logits")
+        ):
+            initial_position_weights = torch.softmax(
+                method_cfg.learnable_module.position_logits.detach().float(), dim=0
+            ).cpu().tolist()
+            print(
+                f"[{cfg.name}] Initial learned-position weights: "
+                f"{[round(w, 6) for w in initial_position_weights]}",
+                flush=True,
+            )
+
     if cfg.grad_checkpoint:
         if is_main:
             print(f"[{cfg.name}] Enabling gradient checkpointing …", flush=True)

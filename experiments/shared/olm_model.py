@@ -161,7 +161,8 @@ class OLMAveragedLanguageModel(nn.Module):
             hidden_dim = backbone.d_model
             if method_config.learnable_module.hidden_dim != hidden_dim:
                 k = method_config.learnable_module.k
-                method_config.learnable_module = LearnableAverager(hidden_dim, k)
+                module_cls = type(method_config.learnable_module)
+                method_config.learnable_module = module_cls(hidden_dim, k)
                 # Re-bind the avg_fn closure to the new, correctly-sized module
                 _new_averager = method_config.learnable_module
                 _k = k

@@ -35,6 +35,7 @@ from utils.averaging_methods import (
     apply_weighted_averaging,
     compute_weights,
     LearnableAverager,
+    PositionalLearnableAverager,
 )
 
 
@@ -46,7 +47,7 @@ from utils.averaging_methods import (
 class MethodConfig:
     """Describes one averaging configuration used inside AveragedLanguageModel."""
     name: str                        # registry key, e.g. "uniform_k2"
-    method_family: str               # "uniform" | "dynamic" | "overlapping" | "weighted" | "learnable" | "baseline"
+    method_family: str               # uniform | dynamic | overlapping | weighted | learnable[_positional] | baseline
     nominal_k: int                   # representative window size (for labelling / CSV)
     compression_ratio: float         # fraction of tokens removed  (0 = no compression)
     # called as avg_fn(hidden [B,T,D]) → (averaged [B,T',D], label_indices [T'-1])
@@ -295,7 +296,24 @@ def build_method_config(name: str, learnable_checkpoint_dir: Optional[str] = Non
             avg_fn=_avg_fn,
         )
 
-    # ---- learnable ----
+    # ---- learnable, with explicit learned within-window position bias ----
+    if name.startswith("learnable_pos_k"):
+        k = int(name.split("_k")[1])
+        averager = PositionalLearnableAverager(hidden_dim=512, k=k)
+
+        def _avg_fn(hidden, input_ids, _averager=averager, _k=k):
+            avg, _ = _averager(hidden)
+            labels = _uniform_labels(input_ids, _k)
+            return avg, labels
+
+        return MethodConfig(
+            name=name, method_family="learnable_positional",
+            nominal_k=k, compression_ratio=1.0 - 1.0 / k,
+            avg_fn=_avg_fn,
+            learnable_module=averager,
+        )
+
+    # ---- learnable, content-only ----
     if name.startswith("learnable_k"):
         k = int(name.split("_k")[1])
         # Hidden dim for Pythia family — will be patched by AveragedLanguageModel
@@ -423,6 +441,7 @@ def get_all_config_names() -> list:
         "weighted_gaussian_k2", "weighted_gaussian_k4", "weighted_gaussian_k8",
         "weighted_triangular_k2", "weighted_triangular_k4", "weighted_triangular_k8",
         "learnable_k2", "learnable_k4", "learnable_k8",
+        "learnable_pos_k2", "learnable_pos_k4", "learnable_pos_k8",
         "word_k2", "word_k4",
     ]
 
@@ -456,7 +475,8 @@ class AveragedLanguageModel(nn.Module):
             hidden_dim = base_model.gpt_neox.embed_in.embedding_dim
             if method_config.learnable_module.hidden_dim != hidden_dim:
                 k = method_config.learnable_module.k
-                method_config.learnable_module = LearnableAverager(hidden_dim, k)
+                module_cls = type(method_config.learnable_module)
+                method_config.learnable_module = module_cls(hidden_dim, k)
                 # Re-bind avg_fn closure to the new module
                 _new_averager = method_config.learnable_module
                 _k = k
