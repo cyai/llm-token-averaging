@@ -27,7 +27,7 @@ log "Starting 500M k=1 (standard, 10B tokens) on 2× H100 GPUs..."
 python -m torch.distributed.run --standalone --nproc_per_node=2 \
   experiments/chinchilla/train.py \
   --model model1_500m \
-  --batch_size 64 --seq_len 1024 --log_steps 500 --eval_batches 16 \
+  --batch_size 32 --seq_len 1024 --log_steps 500 --eval_batches 16 \
   --num_workers 8 --data_dir /data/fineweb --checkpoint_steps 50000 \
   --resume
 log "model1_500m done. Sleeping 2 min..."
@@ -37,7 +37,7 @@ log "Starting 500M k=2 (2× averaging, 20B tokens) on 2× H100 GPUs..."
 python -m torch.distributed.run --standalone --nproc_per_node=2 \
   experiments/chinchilla/train.py \
   --model avg_500m_k2 \
-  --batch_size 64 --seq_len 1024 --log_steps 500 --eval_batches 16 \
+  --batch_size 32 --seq_len 1024 --log_steps 500 --eval_batches 16 \
   --num_workers 8 --data_dir /data/fineweb --checkpoint_steps 50000 \
   --resume
 log "avg_500m_k2 done."
