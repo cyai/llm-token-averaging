@@ -256,11 +256,35 @@ def _eval_loss(
     device: str,
     max_batches: int = 64,
     is_averaged: bool = False,
-) -> float:
-    """Compute mean cross-entropy loss on the eval dataloader (rank-0 only)."""
+    avg_k: int = 1,
+) -> tuple[float, float]:
+    """
+    Compute eval losses on the eval dataloader (rank-0 only).
+
+    Returns (eval_loss, eval_loss_all_pos):
+
+    eval_loss
+        The historical offset-0 metric.  For k > 1 it scores one token per
+        window (~1/k of the positions), so it is comparable *within* a fixed
+        k (all previous logs) but NOT across k.
+
+    eval_loss_all_pos
+        Offset-ensemble loss (same procedure as eval_full_positions.py): the
+        averaged model is run k times per batch with the window grid shifted
+        by o = 0..k-1 tokens; the union covers (nearly) every position.  The
+        per-offset losses are combined weighted by prediction count, giving
+        a full-sequence NLL directly comparable across k.  Equals eval_loss
+        when k == 1.  (For the word-boundary method the weighting uses the
+        logit count, which slightly overweights padded windows — fine for
+        monitoring.)
+
+    Cost: k eval forward passes instead of 1 for averaged models.
+    """
     model.eval()
-    total_loss = 0.0
-    count = 0
+    off0_total = 0.0
+    off0_count = 0
+    all_nll_sum = 0.0
+    all_n_preds = 0
 
     device_type = "cuda" if str(device).startswith("cuda") else "cpu"
 
@@ -276,7 +300,17 @@ def _eval_loss(
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16,
                             enabled=(device_type == "cuda")):
             if is_averaged:
-                loss, _ = model(input_ids)
+                # In eval mode the model pins its internal offset to 0, so
+                # slicing o tokens off the front shifts the window grid by o
+                # and makes the pass predict positions o+k, o+2k, ...
+                for o in range(max(avg_k, 1)):
+                    loss, logits = model(input_ids[:, o:])
+                    n_preds = logits.size(0) * logits.size(1)
+                    all_nll_sum += loss.item() * n_preds
+                    all_n_preds += n_preds
+                    if o == 0:
+                        off0_total += loss.item()
+                        off0_count += 1
             else:
                 logits = model(input_ids)
                 labels = input_ids[:, 1:].contiguous()
@@ -285,11 +319,15 @@ def _eval_loss(
                     logits.reshape(-1, logits.size(-1)),
                     labels.reshape(-1),
                 )
-        total_loss += loss.item()
-        count += 1
+                off0_total += loss.item()
+                off0_count += 1
+                all_nll_sum += loss.item() * labels.numel()
+                all_n_preds += labels.numel()
 
     model.train()
-    return total_loss / max(count, 1)
+    off0 = off0_total / max(off0_count, 1)
+    all_pos = all_nll_sum / max(all_n_preds, 1)
+    return off0, all_pos
 
 
 # ---------------------------------------------------------------------------
@@ -522,7 +560,8 @@ def train_model(
         csv_writer = csv.writer(csv_file)
         if csv_mode == "w":
             csv_writer.writerow(
-                ["step", "tokens_seen", "cumulative_flops", "train_loss", "eval_loss"]
+                ["step", "tokens_seen", "cumulative_flops", "train_loss",
+                 "eval_loss", "eval_loss_all_pos"]
             )
             csv_file.flush()
 
@@ -649,14 +688,15 @@ def train_model(
 
         # --- logging (rank 0) -----------------------------------------------
         if is_main and step % args.log_steps == 0:
-            eval_loss_val = _eval_loss(
+            eval_loss_val, eval_all_val = _eval_loss(
                 model, eval_dl, device,
                 max_batches=args.eval_batches,
                 is_averaged=is_averaged,
+                avg_k=cfg.averaging_k,
             )
             csv_writer.writerow([
                 step, tokens_seen, f"{cumulative_flops:.6e}",
-                f"{ema_val:.6f}", f"{eval_loss_val:.6f}",
+                f"{ema_val:.6f}", f"{eval_loss_val:.6f}", f"{eval_all_val:.6f}",
             ])
             csv_file.flush()
 
@@ -672,6 +712,7 @@ def train_model(
                 f"[{cfg.name}] step={step:>8,} | "
                 f"tokens={tokens_seen/1e9:.3f}B/{cfg.target_tokens/1e9:.0f}B ({pct:.1f}%) | "
                 f"loss={ema_val:.4f} | eval={eval_loss_val:.4f} | "
+                f"evalAll={eval_all_val:.4f} | "
                 f"lr={lr_now:.2e} | flops={cumulative_flops:.2e} | "
                 f"tok/s={tok_s:,.0f} | ETA={eta_h:.1f}h | "
                 f"mem={mem_alloc:.1f}GB/{mem_resrv:.1f}GB",
@@ -703,6 +744,7 @@ def train_model(
                 csv_writer.writerow([
                     step, tokens_seen, f"{cumulative_flops:.6e}",
                     f"{ema_val:.6f}", f"{eval_loss_val:.6f}",
+                    f"{eval_all_val:.6f}",
                 ])
                 csv_file.flush()
                 csv_file.close()
@@ -756,14 +798,15 @@ def train_model(
             },
             final_ckpt,
         )
-        final_eval = _eval_loss(
+        final_eval, final_eval_all = _eval_loss(
             model, eval_dl, device,
             max_batches=args.eval_batches * 2,
             is_averaged=is_averaged,
+            avg_k=cfg.averaging_k,
         )
         csv_writer.writerow([
             step, tokens_seen, f"{cumulative_flops:.6e}",
-            f"{ema_val:.6f}", f"{final_eval:.6f}",
+            f"{ema_val:.6f}", f"{final_eval:.6f}", f"{final_eval_all:.6f}",
         ])
         if csv_file is not None:
             csv_file.flush()
@@ -773,7 +816,8 @@ def train_model(
         elapsed_total = time.time() - t0
         print(
             f"[{cfg.name}] Done.  "
-            f"Final eval loss: {final_eval:.4f}.  "
+            f"Final eval loss: {final_eval:.4f} "
+            f"(all-positions: {final_eval_all:.4f}).  "
             f"Total time: {elapsed_total/3600:.1f}h",
             flush=True,
         )

@@ -782,6 +782,43 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
     # Mean controls reuse the original avg_50m_k2 / avg_50m_k4 configs and
     # select a separate output root with train.py --results_dir.
     # ==================================================================
+    # ------------------------------------------------------------------
+    # ~500M models  (d=1280, h=20, l=22, head_dim=64)
+    # N = 50257×1280 + 22×12×1280² = 64.3M + 432.6M ≈ 497M (tied embeddings)
+    #   model1_500m  : k=1 standard,    target 10B raw tokens (D* ≈ 20N)
+    #   avg_500m_k2  : k=2 averaging,   target 20B raw tokens (transformer sees 10B)
+    # lr ≈ 2e-4 × sqrt(512/1280) ≈ 1.26e-4 → 1.2e-4
+    # ------------------------------------------------------------------
+    "model1_500m": ModelConfig(
+        name="model1_500m",
+        d_model=1280,
+        n_heads=20,
+        n_layers=22,
+        context_len=1024,
+        averaging_k=1,
+        tie_embeddings=True,
+        grad_checkpoint=True,
+        color="#4e9de0",  # blue
+        label="~500M standard (n=1024)",
+        lr=1.2e-4,
+        warmup_steps=2000,
+        target_tokens=10_000_000_000,  # 10B
+    ),
+    "avg_500m_k2": ModelConfig(
+        name="avg_500m_k2",
+        d_model=1280,
+        n_heads=20,
+        n_layers=22,
+        context_len=1024,
+        averaging_k=2,
+        tie_embeddings=True,
+        grad_checkpoint=True,
+        color="#3fb950",  # green
+        label="~500M + 2× averaging",
+        lr=1.2e-4,
+        warmup_steps=2000,
+        target_tokens=20_000_000_000,  # 20B
+    ),
     "avg_50m_k2_learnable_pos": ModelConfig(
         name="avg_50m_k2_learnable_pos",
         d_model=512,
