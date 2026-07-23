@@ -482,6 +482,18 @@ def train_model(
 
     model.to(device)
 
+    # torch.compile: fuses elementwise ops (LayerNorm, GELU, residual adds)
+    # and reduces kernel launch overhead. ~10-20% speedup on H100.
+    # First few steps are slow (compilation warmup), then faster steady-state.
+    if device_type == "cuda":
+        try:
+            model = torch.compile(model)
+            if is_main:
+                print(f"[{cfg.name}] torch.compile enabled", flush=True)
+        except Exception as e:
+            if is_main:
+                print(f"[{cfg.name}] torch.compile skipped: {e}", flush=True)
+
     # Wrap with PyTorch DDP (OLM's DDPTrainer uses this internally as well)
     ddp_model = model
     if world_size > 1:
