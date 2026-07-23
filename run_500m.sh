@@ -10,12 +10,14 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
 # Grad checkpointing: ON  (saves VRAM, ~10 GB/GPU with batch 32)
 #
 # k=1:  10B tokens, seq_len 1024, L=1024
-#       global batch = 64×2 = 128 seqs = 131,072 tokens/step
-#       → 76,293 steps, ~5h wall-clock (@45% MFU)
+#       global batch = 32×2 = 64 seqs = 65,536 tokens/step
+#       → 152,587 steps
 #
 # k=2:  20B raw tokens, seq_len 1024, L=512
-#       global batch = 64×2 = 128 seqs = 131,072 raw tokens/step
-#       → 152,587 steps, ~4.5h wall-clock (@45% MFU)
+#       global batch = 32×2 = 64 seqs = 65,536 raw tokens/step
+#       → 305,175 steps
+#
+# grad_checkpoint=OFF (SDPA/FlashAttn gives O(T) memory, ckpt not needed)
 #
 # ⚠  k=2 needs 20B tokens — FineWeb sample-10BT only has ~10B.
 #    Use a larger FineWeb slice or set --data_dir to a bigger shard.

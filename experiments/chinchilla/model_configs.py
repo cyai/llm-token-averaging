@@ -797,7 +797,7 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         context_len=1024,
         averaging_k=1,
         tie_embeddings=True,
-        grad_checkpoint=True,
+        grad_checkpoint=False,
         color="#4e9de0",  # blue
         label="~500M standard (n=1024)",
         lr=1.2e-4,
@@ -812,12 +812,62 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         context_len=1024,
         averaging_k=2,
         tie_embeddings=True,
-        grad_checkpoint=True,
+        grad_checkpoint=False,
         color="#3fb950",  # green
         label="~500M + 2× averaging",
         lr=1.2e-4,
         warmup_steps=2000,
         target_tokens=20_000_000_000,  # 20B
+    ),
+    # ==================================================================
+    # k=8 POOLING ABLATIONS  (Config A: seq_len 1024, transformer L = 128)
+    # Same protocol as k=2/k=4 ablations.  8.14B token budget (= 8×20N).
+    # ==================================================================
+    "avg_50m_k8_learnable": ModelConfig(
+        name="avg_50m_k8_learnable",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,
+        averaging_k=8,
+        method_name="learnable_k8",
+        grad_checkpoint=False,
+        color="#e67e22",  # orange
+        label="~50M k=8 learnable pooling",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=8_144_000_000,
+    ),
+    "avg_50m_k8_wexp": ModelConfig(
+        name="avg_50m_k8_wexp",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,
+        averaging_k=8,
+        method_name="weighted_exponential_k8",
+        grad_checkpoint=False,
+        color="#8e44ad",  # purple
+        label="~50M k=8 exponential weights",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=8_144_000_000,
+    ),
+    "avg_50m_k8_learnable_pos": ModelConfig(
+        name="avg_50m_k8_learnable_pos",
+        d_model=512,
+        n_heads=8,
+        n_layers=8,
+        context_len=1024,
+        averaging_k=8,
+        method_name="learnable_pos_k8",
+        tie_embeddings=True,
+        grad_checkpoint=False,
+        color="#2471a3",  # dark blue
+        label="~50M k=8 learnable content + position",
+        lr=2e-4,
+        warmup_steps=2000,
+        target_tokens=8_144_000_000,
     ),
     "avg_50m_k2_learnable_pos": ModelConfig(
         name="avg_50m_k2_learnable_pos",
