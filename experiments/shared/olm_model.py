@@ -41,6 +41,32 @@ from experiments.shared.averaged_lm import MethodConfig, _uniform_labels
 
 
 # ---------------------------------------------------------------------------
+# Patch OLM's naive attention → PyTorch SDPA (FlashAttention-2 on Ampere+)
+#
+# OLM's MultiHeadAttentionwithRoPE manually materialises [B,H,T,T] attention
+# scores and re-creates a causal mask tensor every forward pass.
+# PyTorch's scaled_dot_product_attention auto-dispatches to FlashAttention-2
+# on supported GPUs, giving ~2-3x wall-clock speedup and O(T) memory.
+# The mathematical result is identical (scaled dot-product with causal mask).
+# ---------------------------------------------------------------------------
+try:
+    from olm.nn.attention.mha import MultiHeadAttentionwithRoPE as _MHARoPE
+
+    def _sdpa_compute(self, q, k, v, mask=None):
+        # SDPA raises if both attn_mask and is_causal are set;
+        # in normal OLM flow mask is always None and causal is True.
+        use_causal = self.causal and mask is None
+        dp = self.dropout.p if self.training else 0.0
+        return F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, is_causal=use_causal, dropout_p=dp,
+        )
+
+    _MHARoPE.compute_attention = _sdpa_compute
+except Exception:
+    pass  # OLM not installed or API changed; fall back to original
+
+
+# ---------------------------------------------------------------------------
 # OLMTransformerBody
 # ---------------------------------------------------------------------------
 
