@@ -481,14 +481,22 @@ def prepare_dataset(
     print(f"  Found {len(all_shards)} shards.", flush=True)
 
     # ── Step 2: decide how many shards to fetch ──────────────────────────────
-    # FineWeb sample-10BT has ~100M tokens/shard.
+    # Shard sizes differ across subsets:
+    #   sample-10BT  ~100M tokens/shard
+    #   sample-100BT ~730M tokens/shard
+    #   sample-350BT ~100M tokens/shard
     # +2 buffer to avoid off-by-one at boundary.
-    TOKENS_PER_SHARD_EST = 100_000_000
+    _SHARD_SIZE_EST = {
+        "sample-10BT":  100_000_000,
+        "sample-100BT": 730_000_000,
+        "sample-350BT": 100_000_000,
+    }
+    tokens_per_shard = _SHARD_SIZE_EST.get(subset, 100_000_000)
     if max_train_tokens is None:
         n_shards = len(all_shards)
     else:
         n_shards = min(len(all_shards),
-                       max_train_tokens // TOKENS_PER_SHARD_EST + 2)
+                       max_train_tokens // tokens_per_shard + 2)
 
     budget_str = f"{max_train_tokens/1e6:.0f}M" if max_train_tokens else "all"
     print(
