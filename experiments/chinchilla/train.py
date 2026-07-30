@@ -246,6 +246,62 @@ def _enable_gradient_checkpointing(backbone: OLMTransformerBody) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint I/O
+# ---------------------------------------------------------------------------
+
+def save_checkpoint_atomic(state: dict, path: Path) -> None:
+    """Write a checkpoint via a temp file + rename so it is never half-written.
+
+    A crash mid-save (most often a full disk) otherwise leaves a truncated .pt
+    that cannot be unpickled, which makes the next --resume fail outright.
+    os.replace is atomic within a filesystem, so the destination either does
+    not exist or is a complete checkpoint.
+    """
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+        torch.save(state, tmp_path)
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def prune_old_checkpoints(ckpt_dir: Path, keep_last: int) -> None:
+    """Delete all but the newest `keep_last` step_*.pt checkpoints.
+
+    Long runs at 500M+ produce multi-GB checkpoints; keeping every one fills
+    the disk and kills the run. keep_last <= 0 disables pruning.
+    """
+    if keep_last <= 0:
+        return
+    ckpts = sorted(ckpt_dir.glob("step_*.pt"))
+    for stale in ckpts[:-keep_last]:
+        try:
+            size_gb = stale.stat().st_size / 1e9
+            stale.unlink()
+            print(f"  pruned old checkpoint {stale.name} ({size_gb:.1f} GB)",
+                  flush=True)
+        except OSError as e:
+            print(f"  [warn] could not prune {stale.name}: {e}", flush=True)
+
+
+def load_latest_checkpoint(ckpt_dir: Path, device):
+    """Load the newest usable checkpoint, skipping corrupted ones.
+
+    Returns (state, path) or (None, None) when nothing loadable exists. A run
+    killed while saving can leave the newest file unreadable; falling back to
+    the previous one costs some steps but saves the run.
+    """
+    for path in sorted(ckpt_dir.glob("step_*.pt"), reverse=True):
+        try:
+            return torch.load(path, map_location=device), path
+        except Exception as e:
+            print(f"  [warn] checkpoint {path.name} is unreadable ({e}); "
+                  f"trying the previous one.", flush=True)
+    return None, None
+
+
+# ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
 
@@ -527,12 +583,10 @@ def train_model(
     cumulative_flops = 0.0
 
     if args.resume:
-        ckpts = sorted(ckpt_dir.glob("step_*.pt"))
-        if ckpts:
-            latest = ckpts[-1]
+        state, latest = load_latest_checkpoint(ckpt_dir, device)
+        if state is not None:
             if is_main:
                 print(f"[{cfg.name}] Resuming from {latest} …", flush=True)
-            state = torch.load(latest, map_location=device)
             model.load_state_dict(state["model"])
             optimizer.load_state_dict(state["optimizer"])
             scheduler.load_state_dict(state["scheduler"])
@@ -731,7 +785,7 @@ def train_model(
                     flush=True,
                 )
                 early_ckpt = ckpt_dir / f"early_stop_step_{step:08d}.pt"
-                torch.save(
+                save_checkpoint_atomic(
                     {
                         "step":             step,
                         "tokens_seen":      tokens_seen,
@@ -768,7 +822,7 @@ def train_model(
         # --- checkpoint (rank 0; barrier syncs all ranks) -------------------
         if is_main and step % args.checkpoint_steps == 0:
             ckpt_path = ckpt_dir / f"step_{step:08d}.pt"
-            torch.save(
+            save_checkpoint_atomic(
                 {
                     "step":             step,
                     "tokens_seen":      tokens_seen,
@@ -780,6 +834,7 @@ def train_model(
                 ckpt_path,
             )
             print(f"[{cfg.name}] Checkpoint → {ckpt_path}", flush=True)
+            prune_old_checkpoints(ckpt_dir, args.keep_last_checkpoints)
 
         # No per-step barrier: DDP's backward all-reduce already keeps ranks in
         # lock-step every step. Rank-0-only checkpointing is fine — other ranks
@@ -788,7 +843,7 @@ def train_model(
     # --- final checkpoint + eval (rank 0) -----------------------------------
     if is_main:
         final_ckpt = ckpt_dir / "final.pt"
-        torch.save(
+        save_checkpoint_atomic(
             {
                 "step":             step,
                 "tokens_seen":      tokens_seen,
@@ -851,6 +906,10 @@ def parse_args() -> argparse.Namespace:
                    help="Device for single-GPU mode. Ignored by torchrun.")
     p.add_argument("--log_steps",        type=int, default=1_000)
     p.add_argument("--checkpoint_steps", type=int, default=50_000)
+    p.add_argument("--keep_last_checkpoints", type=int, default=3,
+                   help="Retain only the newest N step_*.pt checkpoints "
+                        "(0 = keep all). final.pt is never pruned. Multi-GB "
+                        "checkpoints at 500M+ otherwise fill the disk.")
     p.add_argument("--eval_batches",     type=int, default=64)
     p.add_argument("--num_workers",      type=int, default=4,
                    help="DataLoader workers per rank. Use 4 with local binary "
