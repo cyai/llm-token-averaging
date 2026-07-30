@@ -819,6 +819,56 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         warmup_steps=2000,
         target_tokens=20_000_000_000,  # 20B
     ),
+    # ------------------------------------------------------------------
+    # ~1B models  (d=1664, h=26, l=28, head_dim=64)
+    # Measured: 975,945,984 params with tied embeddings (vocab 50304).
+    #   model1_1b  : k=1 standard,  target 20B raw tokens (D* = 20N ≈ 19.5B)
+    #   avg_1b_k2  : k=2 averaging, target 40B raw tokens (transformer sees 20B)
+    #
+    # Architecture continues the ladder's two invariants:
+    #   head_dim = 64 throughout (512/8, 768/12, 1024/16, 1280/20, 1664/26)
+    #   d/n_layers ≈ 59 (matches 500M's 58.2; earlier scales sat at 64)
+    # d=1664 is divisible by 128, so tensor-core alignment is preserved.
+    #
+    # lr ≈ 2e-4 × sqrt(512/1664) ≈ 1.11e-4 → 1.1e-4
+    #
+    # grad_checkpoint=True is required to hold batch_size 16/GPU on 80 GB
+    # H100s, which is what keeps 32,768 raw tokens/step identical to the
+    # 500M protocol. Protocol consistency matters more than MFU here: a
+    # different tokens/step at 1B would add another confound to the scaling
+    # comparison. With 4+ GPUs, drop to batch_size 8/GPU and set this False
+    # for better MFU at the same global batch.
+    # ------------------------------------------------------------------
+    "model1_1b": ModelConfig(
+        name="model1_1b",
+        d_model=1664,
+        n_heads=26,
+        n_layers=28,
+        context_len=1024,
+        averaging_k=1,
+        tie_embeddings=True,
+        grad_checkpoint=True,
+        color="#4e9de0",  # blue
+        label="~1B standard (n=1024)",
+        lr=1.1e-4,
+        warmup_steps=2000,
+        target_tokens=20_000_000_000,  # 20B
+    ),
+    "avg_1b_k2": ModelConfig(
+        name="avg_1b_k2",
+        d_model=1664,
+        n_heads=26,
+        n_layers=28,
+        context_len=1024,
+        averaging_k=2,
+        tie_embeddings=True,
+        grad_checkpoint=True,
+        color="#3fb950",  # green
+        label="~1B + 2× averaging",
+        lr=1.1e-4,
+        warmup_steps=2000,
+        target_tokens=40_000_000_000,  # 40B
+    ),
     # ==================================================================
     # k=8 POOLING ABLATIONS  (Config A: seq_len 1024, transformer L = 128)
     # Same protocol as k=2/k=4 ablations.  8.14B token budget (= 8×20N).
