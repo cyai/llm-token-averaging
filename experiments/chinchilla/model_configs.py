@@ -832,12 +832,12 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
     #
     # lr ≈ 2e-4 × sqrt(512/1664) ≈ 1.11e-4 → 1.1e-4
     #
-    # grad_checkpoint=True is required to hold batch_size 16/GPU on 80 GB
-    # H100s, which is what keeps 32,768 raw tokens/step identical to the
-    # 500M protocol. Protocol consistency matters more than MFU here: a
+    # grad_checkpoint=True is required for the 1B protocol on 48 GB A6000s
+    # at batch_size 4/GPU (8 GPUs → 32,768 raw tokens/step, identical to the
+    # 500M protocol). Protocol consistency matters more than MFU here: a
     # different tokens/step at 1B would add another confound to the scaling
-    # comparison. With 4+ GPUs, drop to batch_size 8/GPU and set this False
-    # for better MFU at the same global batch.
+    # comparison. On 80 GB H100s you can raise per-GPU batch and/or try
+    # flipping this False after a smoke test; on A6000 leave it True.
     # ------------------------------------------------------------------
     "model1_1b": ModelConfig(
         name="model1_1b",
