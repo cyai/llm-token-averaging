@@ -28,17 +28,17 @@ Usage on the training machine (after ``huggingface-cli login`` or
     # Preview (only runs that have checkpoints/*.pt)
     python experiments/chinchilla/upload_to_hf.py --dry-run
 
-    # Upload those runs to FAIRC (skips files already on the Hub)
+    # Upload those runs to FAIRC (all checkpoints; skips files already on Hub)
     python experiments/chinchilla/upload_to_hf.py
 
-    # Only the 500M / 1B ladder
-    python experiments/chinchilla/upload_to_hf.py --only model1_500m avg_500m_k2 model1_1b avg_1b_k2
+    # If private storage quota is full, make repos public:
+    python experiments/chinchilla/upload_to_hf.py --public
 
-    # Re-upload everything even if already present
-    python experiments/chinchilla/upload_to_hf.py --force
+    # After a failed LFS upload (dangling pointers), repair then push:
+    python experiments/chinchilla/upload_to_hf.py --public --repair
 
-    # Also include loss-log-only dirs (no checkpoints)
-    python experiments/chinchilla/upload_to_hf.py --include-logs-only
+    # Only upload checkpoints/final.pt (saves a lot of storage)
+    python experiments/chinchilla/upload_to_hf.py --public --final-only
 
 Requires:  pip install -U huggingface_hub
 """
@@ -79,6 +79,14 @@ UPLOAD_GLOBS = (
     "README.md",
 )
 
+UPLOAD_GLOBS_FINAL_ONLY = (
+    "loss_log*.csv",
+    "checkpoints/final.pt",
+    "eval*.json",
+    "config.json",
+    "README.md",
+)
+
 REPO_PREFIX = "token-averaging"
 DEFAULT_NAMESPACE = "FAIRC"  # https://huggingface.co/FAIRC
 
@@ -114,13 +122,12 @@ def _human_bytes(n: int) -> str:
     return f"{n:.1f} PB"
 
 
-def _iter_upload_files(run_dir: Path) -> list[Path]:
-    """Collect every file under ``run_dir`` that matches UPLOAD_GLOBS."""
+def _iter_upload_files(run_dir: Path, *, final_only: bool = False) -> list[Path]:
+    """Collect files to upload. Default: loss logs + every ``checkpoints/*.pt``."""
+    patterns = UPLOAD_GLOBS_FINAL_ONLY if final_only else UPLOAD_GLOBS
     found: set[Path] = set()
-    for pattern in UPLOAD_GLOBS:
+    for pattern in patterns:
         found.update(p for p in run_dir.glob(pattern) if p.is_file())
-    # Also pick up any nested loss logs / json that sit at the run root
-    # but were missed by the globs above (defensive).
     for p in run_dir.iterdir():
         if p.is_file() and (
             p.name.startswith("loss_log")
@@ -131,15 +138,18 @@ def _iter_upload_files(run_dir: Path) -> list[Path]:
     return sorted(found)
 
 
-def _list_checkpoints(run_dir: Path) -> list[Path]:
+def _list_checkpoints(run_dir: Path, *, final_only: bool = False) -> list[Path]:
     ckpt_dir = run_dir / "checkpoints"
     if not ckpt_dir.is_dir():
         return []
+    if final_only:
+        final = ckpt_dir / "final.pt"
+        return [final] if final.is_file() else []
     return sorted(p for p in ckpt_dir.glob("*.pt") if p.is_file())
 
 
-def _run_has_checkpoints(run_dir: Path) -> bool:
-    return bool(_list_checkpoints(run_dir))
+def _run_has_checkpoints(run_dir: Path, *, final_only: bool = False) -> bool:
+    return bool(_list_checkpoints(run_dir, final_only=final_only))
 
 
 def _cfg_dict(run_name: str) -> Optional[dict[str, Any]]:
@@ -179,7 +189,9 @@ def _write_sidecar(run_dir: Path, run_name: str, tag: str, repo_id: str) -> None
     config_path = run_dir / "config.json"
     config_path.write_text(json.dumps(meta, indent=2, default=str) + "\n")
 
-    ckpt_names = [p.name for p in _list_checkpoints(run_dir)]
+    ckpt_names = [p.name for p in _list_checkpoints(run_dir, final_only=False)]
+    # README lists every local checkpoint for transparency, even when we
+    # only upload final.pt.
     loss_names = sorted(p.name for p in run_dir.glob("loss_log*.csv"))
 
     lines = [
@@ -260,11 +272,12 @@ def discover_runs(
     only: Optional[set[str]] = None,
     *,
     require_checkpoints: bool = True,
+    final_only: bool = False,
 ) -> list[tuple[Path, str, str]]:
     """Return ``[(run_dir, tag, run_name), ...]``.
 
     By default only runs that have at least one ``checkpoints/*.pt`` are
-    included — loss-log-only directories do not get a repo.
+    included. With ``final_only=True``, require ``checkpoints/final.pt``.
     """
     out: list[tuple[Path, str, str]] = []
     for root in roots:
@@ -278,12 +291,13 @@ def discover_runs(
             run_name = child.name
             if only is not None and run_name not in only:
                 continue
-            ckpts = _list_checkpoints(child)
+            ckpts = _list_checkpoints(child, final_only=final_only)
             if require_checkpoints:
                 if not ckpts:
-                    print(f"[skip] no checkpoints/: {child}", flush=True)
+                    kind = "final.pt" if final_only else "checkpoints/*.pt"
+                    print(f"[skip] no {kind}: {child}", flush=True)
                     continue
-            elif not _iter_upload_files(child) and not ckpts:
+            elif not _iter_upload_files(child, final_only=final_only) and not ckpts:
                 print(f"[skip] empty: {child}", flush=True)
                 continue
             out.append((child, tag, run_name))
@@ -294,7 +308,7 @@ def discover_runs(
                     rel = child
                 names = ", ".join(p.name for p in ckpts)
                 print(
-                    f"[found] {rel} → {len(ckpts)} ckpt(s): {names}",
+                    f"[found] {rel} → {len(ckpts)} ckpt(s) to consider: {names}",
                     flush=True,
                 )
     return out
@@ -309,11 +323,6 @@ def _remote_paths(api, repo_id: str) -> set[str]:
     except RepositoryNotFoundError:
         return set()
     except Exception as exc:  # noqa: BLE001
-        # Older hub versions / private-repo edge cases.
-        try:
-            from huggingface_hub.utils import EntryNotFoundError  # noqa: F401
-        except ImportError:
-            pass
         print(f"  [warn] list_repo_files({repo_id}) failed: {exc}", flush=True)
         return set()
 
@@ -329,18 +338,65 @@ def ensure_repo(api, repo_id: str, private: bool, exist_ok: bool = True) -> None
             exist_ok=exist_ok,
         )
     except HfHubHTTPError as exc:
-        # Race / already exists with different visibility — surface clearly.
         raise RuntimeError(f"create_repo({repo_id}) failed: {exc}") from exc
 
+    # create_repo(..., exist_ok=True) does not flip visibility on an existing
+    # repo. If the user asked for public, enforce it so we escape the private
+    # storage quota.
+    if not private:
+        try:
+            api.update_repo_settings(repo_id=repo_id, repo_type="model", private=False)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [warn] could not set public: {exc}", flush=True)
 
-ALLOW_PATTERNS = [
-    "loss_log*.csv",
-    "checkpoints/*.pt",
-    "checkpoints/*.bin",
-    "eval*.json",
-    "config.json",
-    "README.md",
-]
+
+def _clear_local_upload_cache(run_dir: Path) -> None:
+    """Drop resumable-upload metadata that can re-commit broken LFS pointers."""
+    import shutil
+
+    cache = run_dir / ".cache" / ".huggingface"
+    if cache.is_dir():
+        shutil.rmtree(cache, ignore_errors=True)
+        print(f"  cleared local upload cache: {cache}", flush=True)
+
+
+def _repair_remote_checkpoints(api, repo_id: str, *, dry_run: bool) -> None:
+    """Delete remote checkpoints/* that may be dangling LFS pointers."""
+    from huggingface_hub import CommitOperationDelete
+
+    remote = _remote_paths(api, repo_id)
+    bad = sorted(
+        p
+        for p in remote
+        if p.startswith("checkpoints/") and (p.endswith(".pt") or p.endswith(".bin"))
+    )
+    if not bad:
+        print("  repair: no remote checkpoints/ to delete", flush=True)
+        return
+    print(f"  repair: deleting {len(bad)} remote checkpoint path(s) …", flush=True)
+    for p in bad:
+        print(f"    - {p}", flush=True)
+    if dry_run:
+        print("  [dry-run] skip remote delete", flush=True)
+        return
+    try:
+        api.create_commit(
+            repo_id=repo_id,
+            repo_type="model",
+            operations=[CommitOperationDelete(path_in_repo=p) for p in bad],
+            commit_message="Repair: remove dangling LFS checkpoint pointers",
+        )
+    except Exception:
+        for p in bad:
+            try:
+                api.delete_file(
+                    path_in_repo=p,
+                    repo_id=repo_id,
+                    repo_type="model",
+                    commit_message=f"Repair: delete dangling LFS pointer {p}",
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"    [warn] delete {p} failed: {exc}", flush=True)
 
 
 def upload_run(
@@ -352,20 +408,28 @@ def upload_run(
     dry_run: bool,
     large_folder: bool,
     skip_existing: bool = True,
+    final_only: bool = False,
+    repair: bool = False,
     revision: str = "main",
 ) -> None:
-    files = _iter_upload_files(run_dir)
+    _clear_local_upload_cache(run_dir)
+
+    if repair and api is not None:
+        if not dry_run:
+            ensure_repo(api, repo_id, private=private)
+        _repair_remote_checkpoints(api, repo_id, dry_run=dry_run)
+        # After deleting dangling pointers, force a clean re-push.
+        skip_existing = False
+
+    files = _iter_upload_files(run_dir, final_only=final_only)
     remote: set[str] = set()
-    if skip_existing and not dry_run and api is not None:
-        remote = _remote_paths(api, repo_id)
-    elif skip_existing and dry_run and api is not None:
+    if skip_existing and api is not None:
         remote = _remote_paths(api, repo_id)
 
     to_upload: list[Path] = []
     skipped: list[Path] = []
     for p in files:
         rel = str(p.relative_to(run_dir)).replace("\\", "/")
-        # Always refresh small sidecar metadata so README/config stay current.
         if skip_existing and remote and rel in remote and rel not in (
             "README.md",
             "config.json",
@@ -375,11 +439,11 @@ def upload_run(
             to_upload.append(p)
 
     total = sum(p.stat().st_size for p in to_upload)
-    ckpts = _list_checkpoints(run_dir)
+    ckpts = _list_checkpoints(run_dir, final_only=final_only)
     print(
         f"\n=== {repo_id} ===\n"
         f"  local: {run_dir}\n"
-        f"  checkpoints on disk: {len(ckpts)} "
+        f"  checkpoints selected: {len(ckpts)} "
         f"({', '.join(p.name for p in ckpts) or 'none'})\n"
         f"  upload: {len(to_upload)} file(s)  ({_human_bytes(total)})"
         + (f"  |  skip existing: {len(skipped)}" if skipped else ""),
@@ -401,34 +465,53 @@ def upload_run(
     ensure_repo(api, repo_id, private=private)
     print(f"  repo ready (private={private})", flush=True)
 
-    # Build allow_patterns from the concrete relative paths we decided to
-    # push, so skip-existing is enforced even for upload_folder / large_folder.
     allow = sorted({str(p.relative_to(run_dir)).replace("\\", "/") for p in to_upload})
-
     commit_msg = f"Upload {run_dir.name}: {len(to_upload)} new file(s)"
     t0 = time.time()
 
-    if large_folder or total > 5 * 1024**3:
-        print("  uploading via upload_large_folder …", flush=True)
-        api.upload_large_folder(
-            repo_id=repo_id,
-            folder_path=str(run_dir),
-            repo_type="model",
-            revision=revision,
-            allow_patterns=allow,
-            ignore_patterns=["**/*.tmp", "**/.*", "**/*~"],
-        )
-    else:
-        print("  uploading via upload_folder …", flush=True)
-        api.upload_folder(
-            repo_id=repo_id,
-            folder_path=str(run_dir),
-            repo_type="model",
-            revision=revision,
-            commit_message=commit_msg,
-            allow_patterns=allow,
-            ignore_patterns=["**/*.tmp", "**/.*", "**/*~"],
-        )
+    # Prefer upload_folder for final-only / small sets; large_folder for big
+    # multi-checkpoint dumps (and always when forced).
+    use_large = large_folder or ((not final_only) and total > 5 * 1024**3)
+
+    try:
+        if use_large:
+            print("  uploading via upload_large_folder …", flush=True)
+            api.upload_large_folder(
+                repo_id=repo_id,
+                folder_path=str(run_dir),
+                repo_type="model",
+                revision=revision,
+                allow_patterns=allow,
+                ignore_patterns=["**/*.tmp", "**/.*", "**/*~", "**/.cache/**"],
+            )
+        else:
+            print("  uploading via upload_folder …", flush=True)
+            api.upload_folder(
+                repo_id=repo_id,
+                folder_path=str(run_dir),
+                repo_type="model",
+                revision=revision,
+                commit_message=commit_msg,
+                allow_patterns=allow,
+                ignore_patterns=["**/*.tmp", "**/.*", "**/*~", "**/.cache/**"],
+            )
+    except Exception as exc:
+        msg = str(exc)
+        if "Private repository storage limit" in msg or "storage limit" in msg.lower():
+            raise RuntimeError(
+                f"{exc}\n\n"
+                "HF private storage quota is full. Fixes:\n"
+                "  1) Re-run with --public\n"
+                "  2) Delete step_*.pt from existing private FAIRC repos\n"
+                "  3) Upgrade the FAIRC org plan"
+            ) from exc
+        if "LFS pointer" in msg:
+            raise RuntimeError(
+                f"{exc}\n\n"
+                "Broken LFS pointers on the Hub (interrupted earlier upload).\n"
+                "  Fix:  python experiments/chinchilla/upload_to_hf.py --public --repair"
+            ) from exc
+        raise
 
     dt = time.time() - t0
     print(f"  done in {dt/60:.1f} min → https://huggingface.co/{repo_id}", flush=True)
@@ -493,6 +576,19 @@ def parse_args() -> argparse.Namespace:
         help="Also upload runs that have loss logs but no checkpoints/ (default: skip them).",
     )
     p.add_argument(
+        "--final-only",
+        action="store_true",
+        help="Upload only checkpoints/final.pt (default: every checkpoints/*.pt).",
+    )
+    p.add_argument(
+        "--repair",
+        action="store_true",
+        help=(
+            "Delete remote checkpoints/* (dangling LFS pointers) and clear local "
+            "upload cache before uploading. Use after a failed / interrupted push."
+        ),
+    )
+    p.add_argument(
         "--force",
         action="store_true",
         help="Re-upload files even if the same path already exists on the Hub.",
@@ -516,13 +612,26 @@ def main() -> int:
     only = set(args.only) if args.only else None
     require_ckpts = not args.include_logs_only
     skip_existing = not args.force
+    final_only = args.final_only
 
     print(
-        f"Mode: require_checkpoints={require_ckpts}  "
-        f"skip_existing={skip_existing}",
+        f"Mode: final_only={final_only}  require_checkpoints={require_ckpts}  "
+        f"skip_existing={skip_existing}  private={not args.public}  "
+        f"repair={args.repair}",
         flush=True,
     )
-    runs = discover_runs(roots, only=only, require_checkpoints=require_ckpts)
+    if not args.public:
+        print(
+            "Note: private HF storage is limited. If you hit the quota, re-run with "
+            "--public or delete step_*.pt from existing private repos.",
+            flush=True,
+        )
+    runs = discover_runs(
+        roots,
+        only=only,
+        require_checkpoints=require_ckpts,
+        final_only=final_only,
+    )
     if not runs:
         print(
             "No runs with checkpoints found to upload.\n"
@@ -584,6 +693,8 @@ def main() -> int:
                 dry_run=args.dry_run,
                 large_folder=args.large_folder,
                 skip_existing=skip_existing,
+                final_only=args.final_only,
+                repair=args.repair,
             )
         except Exception as exc:  # noqa: BLE001 — keep sweeping other runs
             print(f"  FAILED: {exc}", flush=True)
