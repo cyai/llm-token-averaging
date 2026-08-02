@@ -25,20 +25,20 @@ the results-root name with the ``results_`` prefix stripped
 Usage on the training machine (after ``huggingface-cli login`` or
 ``export HF_TOKEN=hf_...``):
 
-    # Preview what would be uploaded
+    # Preview (only runs that have checkpoints/*.pt)
     python experiments/chinchilla/upload_to_hf.py --dry-run
 
-    # Upload everything under the default roots (private repos)
+    # Upload those runs to FAIRC (skips files already on the Hub)
     python experiments/chinchilla/upload_to_hf.py
 
     # Only the 500M / 1B ladder
     python experiments/chinchilla/upload_to_hf.py --only model1_500m avg_500m_k2 model1_1b avg_1b_k2
 
-    # Public repos (still under FAIRC by default)
-    python experiments/chinchilla/upload_to_hf.py --public
+    # Re-upload everything even if already present
+    python experiments/chinchilla/upload_to_hf.py --force
 
-    # Different namespace
-    python experiments/chinchilla/upload_to_hf.py --namespace my-user
+    # Also include loss-log-only dirs (no checkpoints)
+    python experiments/chinchilla/upload_to_hf.py --include-logs-only
 
 Requires:  pip install -U huggingface_hub
 """
@@ -131,17 +131,15 @@ def _iter_upload_files(run_dir: Path) -> list[Path]:
     return sorted(found)
 
 
-def _run_has_content(run_dir: Path) -> bool:
-    files = _iter_upload_files(run_dir)
-    # A run with only a README we just wrote does not count as content.
-    return any(
-        p.name.startswith("loss_log")
-        or p.suffix == ".pt"
-        or p.name.startswith("eval")
-        for p in files
-    ) or (run_dir / "checkpoints").is_dir() and any(
-        (run_dir / "checkpoints").glob("*.pt")
-    )
+def _list_checkpoints(run_dir: Path) -> list[Path]:
+    ckpt_dir = run_dir / "checkpoints"
+    if not ckpt_dir.is_dir():
+        return []
+    return sorted(p for p in ckpt_dir.glob("*.pt") if p.is_file())
+
+
+def _run_has_checkpoints(run_dir: Path) -> bool:
+    return bool(_list_checkpoints(run_dir))
 
 
 def _cfg_dict(run_name: str) -> Optional[dict[str, Any]]:
@@ -181,8 +179,7 @@ def _write_sidecar(run_dir: Path, run_name: str, tag: str, repo_id: str) -> None
     config_path = run_dir / "config.json"
     config_path.write_text(json.dumps(meta, indent=2, default=str) + "\n")
 
-    ckpt_dir = run_dir / "checkpoints"
-    ckpt_names = sorted(p.name for p in ckpt_dir.glob("*.pt")) if ckpt_dir.is_dir() else []
+    ckpt_names = [p.name for p in _list_checkpoints(run_dir)]
     loss_names = sorted(p.name for p in run_dir.glob("loss_log*.csv"))
 
     lines = [
@@ -261,8 +258,14 @@ def _write_sidecar(run_dir: Path, run_name: str, tag: str, repo_id: str) -> None
 def discover_runs(
     roots: Iterable[Path],
     only: Optional[set[str]] = None,
+    *,
+    require_checkpoints: bool = True,
 ) -> list[tuple[Path, str, str]]:
-    """Return ``[(run_dir, tag, run_name), ...]`` for every non-empty run."""
+    """Return ``[(run_dir, tag, run_name), ...]``.
+
+    By default only runs that have at least one ``checkpoints/*.pt`` are
+    included — loss-log-only directories do not get a repo.
+    """
     out: list[tuple[Path, str, str]] = []
     for root in roots:
         if not root.is_dir():
@@ -275,11 +278,44 @@ def discover_runs(
             run_name = child.name
             if only is not None and run_name not in only:
                 continue
-            if not _run_has_content(child):
-                print(f"[skip] empty / no logs or ckpts: {child}", flush=True)
+            ckpts = _list_checkpoints(child)
+            if require_checkpoints:
+                if not ckpts:
+                    print(f"[skip] no checkpoints/: {child}", flush=True)
+                    continue
+            elif not _iter_upload_files(child) and not ckpts:
+                print(f"[skip] empty: {child}", flush=True)
                 continue
             out.append((child, tag, run_name))
+            if ckpts:
+                try:
+                    rel = child.relative_to(_ROOT)
+                except ValueError:
+                    rel = child
+                names = ", ".join(p.name for p in ckpts)
+                print(
+                    f"[found] {rel} → {len(ckpts)} ckpt(s): {names}",
+                    flush=True,
+                )
     return out
+
+
+def _remote_paths(api, repo_id: str) -> set[str]:
+    """Return paths already in the remote repo, or empty set if repo missing."""
+    from huggingface_hub.utils import RepositoryNotFoundError
+
+    try:
+        return set(api.list_repo_files(repo_id=repo_id, repo_type="model"))
+    except RepositoryNotFoundError:
+        return set()
+    except Exception as exc:  # noqa: BLE001
+        # Older hub versions / private-repo edge cases.
+        try:
+            from huggingface_hub.utils import EntryNotFoundError  # noqa: F401
+        except ImportError:
+            pass
+        print(f"  [warn] list_repo_files({repo_id}) failed: {exc}", flush=True)
+        return set()
 
 
 def ensure_repo(api, repo_id: str, private: bool, exist_ok: bool = True) -> None:
@@ -297,6 +333,16 @@ def ensure_repo(api, repo_id: str, private: bool, exist_ok: bool = True) -> None
         raise RuntimeError(f"create_repo({repo_id}) failed: {exc}") from exc
 
 
+ALLOW_PATTERNS = [
+    "loss_log*.csv",
+    "checkpoints/*.pt",
+    "checkpoints/*.bin",
+    "eval*.json",
+    "config.json",
+    "README.md",
+]
+
+
 def upload_run(
     api,
     run_dir: Path,
@@ -305,19 +351,48 @@ def upload_run(
     private: bool,
     dry_run: bool,
     large_folder: bool,
+    skip_existing: bool = True,
     revision: str = "main",
 ) -> None:
     files = _iter_upload_files(run_dir)
-    total = sum(p.stat().st_size for p in files)
+    remote: set[str] = set()
+    if skip_existing and not dry_run and api is not None:
+        remote = _remote_paths(api, repo_id)
+    elif skip_existing and dry_run and api is not None:
+        remote = _remote_paths(api, repo_id)
+
+    to_upload: list[Path] = []
+    skipped: list[Path] = []
+    for p in files:
+        rel = str(p.relative_to(run_dir)).replace("\\", "/")
+        # Always refresh small sidecar metadata so README/config stay current.
+        if skip_existing and remote and rel in remote and rel not in (
+            "README.md",
+            "config.json",
+        ):
+            skipped.append(p)
+        else:
+            to_upload.append(p)
+
+    total = sum(p.stat().st_size for p in to_upload)
+    ckpts = _list_checkpoints(run_dir)
     print(
         f"\n=== {repo_id} ===\n"
         f"  local: {run_dir}\n"
-        f"  files: {len(files)}  ({_human_bytes(total)})",
+        f"  checkpoints on disk: {len(ckpts)} "
+        f"({', '.join(p.name for p in ckpts) or 'none'})\n"
+        f"  upload: {len(to_upload)} file(s)  ({_human_bytes(total)})"
+        + (f"  |  skip existing: {len(skipped)}" if skipped else ""),
         flush=True,
     )
-    for p in files:
-        rel = p.relative_to(run_dir)
-        print(f"    {rel}  ({_human_bytes(p.stat().st_size)})", flush=True)
+    for p in to_upload:
+        print(f"    + {p.relative_to(run_dir)}  ({_human_bytes(p.stat().st_size)})", flush=True)
+    for p in skipped:
+        print(f"    = {p.relative_to(run_dir)}  (already on Hub)", flush=True)
+
+    if not to_upload:
+        print("  nothing new to upload", flush=True)
+        return
 
     if dry_run:
         print("  [dry-run] skip create/upload", flush=True)
@@ -326,27 +401,21 @@ def upload_run(
     ensure_repo(api, repo_id, private=private)
     print(f"  repo ready (private={private})", flush=True)
 
-    commit_msg = f"Upload {run_dir.name} checkpoints + loss logs"
+    # Build allow_patterns from the concrete relative paths we decided to
+    # push, so skip-existing is enforced even for upload_folder / large_folder.
+    allow = sorted({str(p.relative_to(run_dir)).replace("\\", "/") for p in to_upload})
+
+    commit_msg = f"Upload {run_dir.name}: {len(to_upload)} new file(s)"
     t0 = time.time()
 
     if large_folder or total > 5 * 1024**3:
-        # Resumable multi-worker path — right choice for 500M / 1B dumps.
         print("  uploading via upload_large_folder …", flush=True)
         api.upload_large_folder(
             repo_id=repo_id,
             folder_path=str(run_dir),
             repo_type="model",
             revision=revision,
-            # Only push what we care about; ignore anything else that
-            # might have landed in the run dir (tmp, .pt.tmp, etc.).
-            allow_patterns=[
-                "loss_log*.csv",
-                "checkpoints/*.pt",
-                "checkpoints/*.bin",
-                "eval*.json",
-                "config.json",
-                "README.md",
-            ],
+            allow_patterns=allow,
             ignore_patterns=["**/*.tmp", "**/.*", "**/*~"],
         )
     else:
@@ -357,14 +426,7 @@ def upload_run(
             repo_type="model",
             revision=revision,
             commit_message=commit_msg,
-            allow_patterns=[
-                "loss_log*.csv",
-                "checkpoints/*.pt",
-                "checkpoints/*.bin",
-                "eval*.json",
-                "config.json",
-                "README.md",
-            ],
+            allow_patterns=allow,
             ignore_patterns=["**/*.tmp", "**/.*", "**/*~"],
         )
 
@@ -379,7 +441,10 @@ def upload_run(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Create one HF repo per training run and upload checkpoints + loss logs.",
+        description=(
+            "Create one HF repo per training run that has checkpoints, "
+            "and upload only files not already on the Hub."
+        ),
     )
     p.add_argument(
         "--results-root",
@@ -423,6 +488,16 @@ def parse_args() -> argparse.Namespace:
         help="Also sweep experiments/chinchilla/results_old.",
     )
     p.add_argument(
+        "--include-logs-only",
+        action="store_true",
+        help="Also upload runs that have loss logs but no checkpoints/ (default: skip them).",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-upload files even if the same path already exists on the Hub.",
+    )
+    p.add_argument(
         "--token",
         default=None,
         help="HF token. Default: $HF_TOKEN / cached login.",
@@ -436,25 +511,38 @@ def main() -> int:
     roots_raw = args.results_roots or list(DEFAULT_ROOTS)
     if args.include_old:
         roots_raw.append("experiments/chinchilla/results_old")
-    roots = [( _ROOT / r if not Path(r).is_absolute() else Path(r)) for r in roots_raw]
+    roots = [(_ROOT / r if not Path(r).is_absolute() else Path(r)) for r in roots_raw]
 
     only = set(args.only) if args.only else None
-    runs = discover_runs(roots, only=only)
+    require_ckpts = not args.include_logs_only
+    skip_existing = not args.force
+
+    print(
+        f"Mode: require_checkpoints={require_ckpts}  "
+        f"skip_existing={skip_existing}",
+        flush=True,
+    )
+    runs = discover_runs(roots, only=only, require_checkpoints=require_ckpts)
     if not runs:
-        print("No runs found to upload.", flush=True)
+        print(
+            "No runs with checkpoints found to upload.\n"
+            "  (pass --include-logs-only to also upload loss-log-only dirs)",
+            flush=True,
+        )
         return 1
 
-    print(f"Discovered {len(runs)} run(s) across {len(roots)} root(s).", flush=True)
+    print(f"Discovered {len(runs)} run(s) with checkpoints across {len(roots)} root(s).", flush=True)
 
-    # Resolve namespace / API only when we need them (dry-run still needs
-    # the namespace to print the intended repo ids).
     token = args.token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     namespace = args.namespace  # default: FAIRC
     api = None
 
     print(f"Target namespace: {namespace}", flush=True)
 
-    if not args.dry_run:
+    # Need the API whenever we upload, or when dry-running with skip-existing
+    # so we can show which remote files would be skipped.
+    need_api = (not args.dry_run) or skip_existing
+    if need_api:
         try:
             from huggingface_hub import HfApi, whoami
         except ImportError:
@@ -495,6 +583,7 @@ def main() -> int:
                 private=private,
                 dry_run=args.dry_run,
                 large_folder=args.large_folder,
+                skip_existing=skip_existing,
             )
         except Exception as exc:  # noqa: BLE001 — keep sweeping other runs
             print(f"  FAILED: {exc}", flush=True)
