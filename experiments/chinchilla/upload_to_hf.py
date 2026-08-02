@@ -34,10 +34,13 @@ Usage on the training machine (after ``huggingface-cli login`` or
     # If private storage quota is full, make repos public:
     python experiments/chinchilla/upload_to_hf.py --public
 
-    # After a failed LFS upload (dangling pointers), repair then push:
-    python experiments/chinchilla/upload_to_hf.py --public --repair
+    # Broken LFS pointers: wipe repo and re-upload final.pt only first
+    python experiments/chinchilla/upload_to_hf.py --public --recreate --final-only
 
-    # Only upload checkpoints/final.pt (saves a lot of storage)
+    # Then (optional) push the rest of the step checkpoints into the clean repo
+    python experiments/chinchilla/upload_to_hf.py --public
+
+    # Only upload checkpoints/final.pt
     python experiments/chinchilla/upload_to_hf.py --public --final-only
 
 Requires:  pip install -U huggingface_hub
@@ -340,14 +343,34 @@ def ensure_repo(api, repo_id: str, private: bool, exist_ok: bool = True) -> None
     except HfHubHTTPError as exc:
         raise RuntimeError(f"create_repo({repo_id}) failed: {exc}") from exc
 
-    # create_repo(..., exist_ok=True) does not flip visibility on an existing
-    # repo. If the user asked for public, enforce it so we escape the private
-    # storage quota.
     if not private:
         try:
             api.update_repo_settings(repo_id=repo_id, repo_type="model", private=False)
         except Exception as exc:  # noqa: BLE001
             print(f"  [warn] could not set public: {exc}", flush=True)
+
+
+def recreate_repo(api, repo_id: str, private: bool, *, dry_run: bool) -> None:
+    """Delete the repo entirely and create a fresh empty one.
+
+    Reliable fix when dangling LFS pointers block every subsequent commit
+    (including path deletes via --repair).
+    """
+    from huggingface_hub.utils import RepositoryNotFoundError
+
+    print(f"  recreate: deleting repo {repo_id} …", flush=True)
+    if dry_run:
+        print("  [dry-run] skip delete/create", flush=True)
+        return
+    try:
+        api.delete_repo(repo_id=repo_id, repo_type="model")
+        time.sleep(2)
+    except RepositoryNotFoundError:
+        print("  recreate: repo did not exist yet", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [warn] delete_repo failed ({exc}); trying create anyway", flush=True)
+    ensure_repo(api, repo_id, private=private, exist_ok=True)
+    print(f"  recreate: fresh repo ready (private={private})", flush=True)
 
 
 def _clear_local_upload_cache(run_dir: Path) -> None:
@@ -386,17 +409,41 @@ def _repair_remote_checkpoints(api, repo_id: str, *, dry_run: bool) -> None:
             operations=[CommitOperationDelete(path_in_repo=p) for p in bad],
             commit_message="Repair: remove dangling LFS checkpoint pointers",
         )
-    except Exception:
-        for p in bad:
-            try:
-                api.delete_file(
-                    path_in_repo=p,
-                    repo_id=repo_id,
-                    repo_type="model",
-                    commit_message=f"Repair: delete dangling LFS pointer {p}",
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"    [warn] delete {p} failed: {exc}", flush=True)
+    except Exception as exc:
+        raise RuntimeError(
+            f"repair delete failed ({exc}).\n"
+            "  Repo LFS state is too broken for path deletes — re-run with --recreate"
+        ) from exc
+
+
+def _upload_files_single_commit(
+    api,
+    run_dir: Path,
+    repo_id: str,
+    files: list[Path],
+    *,
+    revision: str,
+    commit_message: str,
+) -> None:
+    """Upload every file in one Hub commit (LFS-aware via CommitOperationAdd)."""
+    from huggingface_hub import CommitOperationAdd
+
+    ops = []
+    for p in files:
+        rel = str(p.relative_to(run_dir)).replace("\\", "/")
+        size = _human_bytes(p.stat().st_size)
+        print(f"    stage {rel} ({size})", flush=True)
+        ops.append(
+            CommitOperationAdd(path_in_repo=rel, path_or_fileobj=str(p))
+        )
+    print(f"  committing {len(ops)} file(s) in a single commit …", flush=True)
+    api.create_commit(
+        repo_id=repo_id,
+        repo_type="model",
+        operations=ops,
+        commit_message=commit_message,
+        revision=revision,
+    )
 
 
 def upload_run(
@@ -410,20 +457,23 @@ def upload_run(
     skip_existing: bool = True,
     final_only: bool = False,
     repair: bool = False,
+    recreate: bool = False,
     revision: str = "main",
 ) -> None:
     _clear_local_upload_cache(run_dir)
 
-    if repair and api is not None:
+    if recreate and api is not None:
+        recreate_repo(api, repo_id, private=private, dry_run=dry_run)
+        skip_existing = False
+    elif repair and api is not None:
         if not dry_run:
             ensure_repo(api, repo_id, private=private)
         _repair_remote_checkpoints(api, repo_id, dry_run=dry_run)
-        # After deleting dangling pointers, force a clean re-push.
         skip_existing = False
 
     files = _iter_upload_files(run_dir, final_only=final_only)
     remote: set[str] = set()
-    if skip_existing and api is not None:
+    if skip_existing and api is not None and not recreate:
         remote = _remote_paths(api, repo_id)
 
     to_upload: list[Path] = []
@@ -462,19 +512,18 @@ def upload_run(
         print("  [dry-run] skip create/upload", flush=True)
         return
 
-    ensure_repo(api, repo_id, private=private)
+    if not recreate:
+        ensure_repo(api, repo_id, private=private)
     print(f"  repo ready (private={private})", flush=True)
 
-    allow = sorted({str(p.relative_to(run_dir)).replace("\\", "/") for p in to_upload})
-    commit_msg = f"Upload {run_dir.name}: {len(to_upload)} new file(s)"
     t0 = time.time()
-
-    # Prefer upload_folder for final-only / small sets; large_folder for big
-    # multi-checkpoint dumps (and always when forced).
-    use_large = large_folder or ((not final_only) and total > 5 * 1024**3)
+    commit_msg = f"Upload {run_dir.name}: {len(to_upload)} file(s)"
 
     try:
-        if use_large:
+        if large_folder:
+            allow = sorted(
+                {str(p.relative_to(run_dir)).replace("\\", "/") for p in to_upload}
+            )
             print("  uploading via upload_large_folder …", flush=True)
             api.upload_large_folder(
                 repo_id=repo_id,
@@ -485,31 +534,30 @@ def upload_run(
                 ignore_patterns=["**/*.tmp", "**/.*", "**/*~", "**/.cache/**"],
             )
         else:
-            print("  uploading via upload_folder …", flush=True)
-            api.upload_folder(
-                repo_id=repo_id,
-                folder_path=str(run_dir),
-                repo_type="model",
+            # One create_commit for the whole run: Hub pre-uploads LFS blobs,
+            # then records every path in a single commit.
+            print("  uploading in a single commit …", flush=True)
+            _upload_files_single_commit(
+                api,
+                run_dir,
+                repo_id,
+                to_upload,
                 revision=revision,
                 commit_message=commit_msg,
-                allow_patterns=allow,
-                ignore_patterns=["**/*.tmp", "**/.*", "**/*~", "**/.cache/**"],
             )
     except Exception as exc:
         msg = str(exc)
         if "Private repository storage limit" in msg or "storage limit" in msg.lower():
             raise RuntimeError(
                 f"{exc}\n\n"
-                "HF private storage quota is full. Fixes:\n"
-                "  1) Re-run with --public\n"
-                "  2) Delete step_*.pt from existing private FAIRC repos\n"
-                "  3) Upgrade the FAIRC org plan"
+                "HF private storage quota is full. Re-run with --public."
             ) from exc
         if "LFS pointer" in msg:
             raise RuntimeError(
                 f"{exc}\n\n"
-                "Broken LFS pointers on the Hub (interrupted earlier upload).\n"
-                "  Fix:  python experiments/chinchilla/upload_to_hf.py --public --repair"
+                "Broken LFS pointers on the Hub.\n"
+                "  Wipe and re-upload cleanly:\n"
+                "    python experiments/chinchilla/upload_to_hf.py --public --recreate --final-only"
             ) from exc
         raise
 
@@ -563,7 +611,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--large-folder",
         action="store_true",
-        help="Force resumable upload_large_folder for every run (default: auto when >5 GB).",
+        help="Force resumable upload_large_folder (not recommended if LFS was broken).",
     )
     p.add_argument(
         "--include-old",
@@ -581,11 +629,19 @@ def parse_args() -> argparse.Namespace:
         help="Upload only checkpoints/final.pt (default: every checkpoints/*.pt).",
     )
     p.add_argument(
+        "--recreate",
+        action="store_true",
+        help=(
+            "Delete each target HF repo and recreate it empty before uploading. "
+            "Use this when dangling LFS pointers make every commit fail."
+        ),
+    )
+    p.add_argument(
         "--repair",
         action="store_true",
         help=(
-            "Delete remote checkpoints/* (dangling LFS pointers) and clear local "
-            "upload cache before uploading. Use after a failed / interrupted push."
+            "Delete remote checkpoints/* before uploading. Prefer --recreate if "
+            "this also fails with an LFS pointer error."
         ),
     )
     p.add_argument(
@@ -611,19 +667,18 @@ def main() -> int:
 
     only = set(args.only) if args.only else None
     require_ckpts = not args.include_logs_only
-    skip_existing = not args.force
+    skip_existing = not args.force and not args.recreate
     final_only = args.final_only
 
     print(
         f"Mode: final_only={final_only}  require_checkpoints={require_ckpts}  "
         f"skip_existing={skip_existing}  private={not args.public}  "
-        f"repair={args.repair}",
+        f"repair={args.repair}  recreate={args.recreate}",
         flush=True,
     )
     if not args.public:
         print(
-            "Note: private HF storage is limited. If you hit the quota, re-run with "
-            "--public or delete step_*.pt from existing private repos.",
+            "Note: private HF storage is limited. If you hit the quota, re-run with --public.",
             flush=True,
         )
     runs = discover_runs(
@@ -643,14 +698,12 @@ def main() -> int:
     print(f"Discovered {len(runs)} run(s) with checkpoints across {len(roots)} root(s).", flush=True)
 
     token = args.token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    namespace = args.namespace  # default: FAIRC
+    namespace = args.namespace
     api = None
 
     print(f"Target namespace: {namespace}", flush=True)
 
-    # Need the API whenever we upload, or when dry-running with skip-existing
-    # so we can show which remote files would be skipped.
-    need_api = (not args.dry_run) or skip_existing
+    need_api = (not args.dry_run) or skip_existing or args.repair or args.recreate
     if need_api:
         try:
             from huggingface_hub import HfApi, whoami
@@ -695,8 +748,9 @@ def main() -> int:
                 skip_existing=skip_existing,
                 final_only=args.final_only,
                 repair=args.repair,
+                recreate=args.recreate,
             )
-        except Exception as exc:  # noqa: BLE001 — keep sweeping other runs
+        except Exception as exc:  # noqa: BLE001
             print(f"  FAILED: {exc}", flush=True)
             failures.append(f"{repo_id}: {exc}")
 
