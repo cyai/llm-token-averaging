@@ -59,9 +59,9 @@ FINEWEB_REPO = "HuggingFaceFW/fineweb"
 # The loader auto-selects the smallest subset that covers the requested budget,
 # with a 10 % headroom so we never run out mid-training.
 _FINEWEB_SUBSETS: list[tuple[str, int]] = [
-    ("sample-10BT",   9_000_000_000),    # ~10B  tokens — use for ≤ 9B  requests
-    ("sample-100BT", 90_000_000_000),    # ~100B tokens — use for ≤ 90B requests
-    ("sample-350BT", 315_000_000_000),   # ~350B tokens — use for ≤ 315B requests
+    ("sample-10BT", 9_000_000_000),  # ~10B  tokens — use for ≤ 9B  requests
+    ("sample-100BT", 90_000_000_000),  # ~100B tokens — use for ≤ 90B requests
+    ("sample-350BT", 315_000_000_000),  # ~350B tokens — use for ≤ 315B requests
 ]
 _FINEWEB_DEFAULT_SUBSET = "sample-350BT"  # fallback when budget > 315B or None
 
@@ -76,13 +76,14 @@ def _select_subset(max_train_tokens: Optional[int]) -> str:
     return _FINEWEB_DEFAULT_SUBSET
 
 
-EVAL_DOCS = 5_000        # first N docs reserved for eval
-DTYPE     = np.uint16    # GPT-NeoX vocab 50 257 fits in uint16
+EVAL_DOCS = 5_000  # first N docs reserved for eval
+DTYPE = np.uint16  # GPT-NeoX vocab 50 257 fits in uint16
 
 
 # ---------------------------------------------------------------------------
 # 1.  LOCAL BINARY CACHE  (fastest path)
 # ---------------------------------------------------------------------------
+
 
 class _LocalBinDataset(Dataset):
     """
@@ -93,8 +94,8 @@ class _LocalBinDataset(Dataset):
 
     def __init__(self, path: Path, seq_len: int):
         self.seq_len = seq_len
-        self.data    = np.memmap(path, dtype=DTYPE, mode="r")
-        self.n_seqs  = (len(self.data) - 1) // seq_len
+        self.data = np.memmap(path, dtype=DTYPE, mode="r")
+        self.n_seqs = (len(self.data) - 1) // seq_len
 
     def __len__(self):
         return self.n_seqs
@@ -115,11 +116,12 @@ def _build_local_dataloaders(
     from torch.utils.data import DistributedSampler
 
     train_ds = _LocalBinDataset(data_dir / "train.bin", seq_len)
-    eval_ds  = _LocalBinDataset(data_dir / "eval.bin",  seq_len)
+    eval_ds = _LocalBinDataset(data_dir / "eval.bin", seq_len)
 
     train_sampler = (
         DistributedSampler(train_ds, shuffle=True, drop_last=True)
-        if distributed else None
+        if distributed
+        else None
     )
     train_dl = DataLoader(
         train_ds,
@@ -146,6 +148,7 @@ def _build_local_dataloaders(
 # 1b. LOCAL .tok.bin SHARD STREAMING  (second-fastest — no network needed)
 # ---------------------------------------------------------------------------
 
+
 def _find_tok_bin_files(data_dir: Path) -> list[Path]:
     """Return all *.tok.bin shards under data_dir/raw/, sorted by path."""
     raw_dir = data_dir / "raw"
@@ -167,36 +170,36 @@ class _TokBinStreamDataset(IterableDataset):
         self,
         tok_files: list[Path],
         seq_len: int,
-        skip_head_tokens: int = 0,   # skip this many tokens at the start of tok_files[0]
+        skip_head_tokens: int = 0,  # skip this many tokens at the start of tok_files[0]
         rank: int = 0,
         world_size: int = 1,
     ):
         super().__init__()
-        self.tok_files         = tok_files
-        self.seq_len           = seq_len
-        self.skip_head_tokens  = skip_head_tokens
-        self.rank              = rank
-        self.world_size        = world_size
+        self.tok_files = tok_files
+        self.seq_len = seq_len
+        self.skip_head_tokens = skip_head_tokens
+        self.rank = rank
+        self.world_size = world_size
 
     def __iter__(self):
         wi = torch.utils.data.get_worker_info()
         if wi is not None:
             eff_rank = self.rank * wi.num_workers + wi.id
-            eff_ws   = self.world_size * wi.num_workers
+            eff_ws = self.world_size * wi.num_workers
         else:
             eff_rank = self.rank
-            eff_ws   = self.world_size
+            eff_ws = self.world_size
 
         global_seq = 0
-        while True:   # loop forever — training is controlled by step count
+        while True:  # loop forever — training is controlled by step count
             for file_i, tok_file in enumerate(self.tok_files):
-                data  = np.memmap(tok_file, dtype=DTYPE, mode="r")
+                data = np.memmap(tok_file, dtype=DTYPE, mode="r")
                 start = self.skip_head_tokens if file_i == 0 else 0
                 n_seqs = (len(data) - start - 1) // self.seq_len
                 for s in range(n_seqs):
                     if global_seq % eff_ws == eff_rank:
                         offset = start + s * self.seq_len
-                        chunk  = np.array(
+                        chunk = np.array(
                             data[offset : offset + self.seq_len], dtype=np.int64
                         )
                         yield torch.from_numpy(chunk)
@@ -217,9 +220,11 @@ def _build_tok_bin_dataloaders(
     from torch.utils.data import DistributedSampler
 
     train_ds = _TokBinStreamDataset(
-        tok_files, seq_len,
+        tok_files,
+        seq_len,
         skip_head_tokens=skip_head_tokens,
-        rank=rank, world_size=world_size,
+        rank=rank,
+        world_size=world_size,
     )
     train_dl = DataLoader(
         train_ds,
@@ -234,9 +239,11 @@ def _build_tok_bin_dataloaders(
     else:
         # No eval.bin — use a small slice of the first shard
         eval_ds = _TokBinStreamDataset(
-            [tok_files[0]], seq_len,
+            [tok_files[0]],
+            seq_len,
             skip_head_tokens=0,
-            rank=0, world_size=1,
+            rank=0,
+            world_size=1,
         )
 
     eval_dl = DataLoader(
@@ -254,12 +261,15 @@ def _build_tok_bin_dataloaders(
 # 1c. LOCAL PARQUET STREAMING  (third priority — tokenise on-the-fly from disk)
 # ---------------------------------------------------------------------------
 
+
 def _find_local_parquet_files(data_dir: Path) -> list[Path]:
     """Return all *.parquet files under data_dir/raw/ (excl. .tok.bin), sorted."""
     raw_dir = data_dir / "raw"
     if not raw_dir.exists():
         return []
-    return sorted(p for p in raw_dir.rglob("*.parquet") if not str(p).endswith(".tok.bin"))
+    return sorted(
+        p for p in raw_dir.rglob("*.parquet") if not str(p).endswith(".tok.bin")
+    )
 
 
 def _local_parquet_doc_stream(
@@ -298,26 +308,26 @@ class _LocalParquetStreamDataset(IterableDataset):
         world_size: int = 1,
     ):
         super().__init__()
-        self.parquet_files  = parquet_files
+        self.parquet_files = parquet_files
         self.tokenizer_name = tokenizer_name
-        self.seq_len        = seq_len
-        self.skip_docs      = skip_docs
-        self.rank           = rank
-        self.world_size     = world_size
+        self.seq_len = seq_len
+        self.skip_docs = skip_docs
+        self.rank = rank
+        self.world_size = world_size
 
     def __iter__(self):
         wi = torch.utils.data.get_worker_info()
         if wi is not None:
             eff_rank = self.rank * wi.num_workers + wi.id
-            eff_ws   = self.world_size * wi.num_workers
+            eff_ws = self.world_size * wi.num_workers
         else:
             eff_rank = self.rank
-            eff_ws   = self.world_size
+            eff_ws = self.world_size
 
         tok = AutoTokenizer.from_pretrained(self.tokenizer_name, use_fast=True)
         eos = tok.eos_token_id or 0
 
-        while True:   # loop forever for training
+        while True:  # loop forever for training
             yield from _tokenize_and_pack(
                 _local_parquet_doc_stream(
                     self.parquet_files,
@@ -325,7 +335,9 @@ class _LocalParquetStreamDataset(IterableDataset):
                     rank=eff_rank,
                     world_size=eff_ws,
                 ),
-                tok, self.seq_len, eos=eos,
+                tok,
+                self.seq_len,
+                eos=eos,
             )
 
 
@@ -333,11 +345,13 @@ class _LocalParquetStreamDataset(IterableDataset):
 # 2.  DATASET PREPARATION — parallel download + multiprocess tokenisation
 # ---------------------------------------------------------------------------
 
+
 def _list_shard_paths(subset: str) -> list[str]:
     """Return sorted parquet shard paths for the given FineWeb subset on HF Hub."""
     from huggingface_hub import list_repo_tree
+
     # e.g. "sample-10BT" → look for "10BT" anywhere in the path
-    subset_key = subset.replace("sample-", "")   # "10BT", "100BT", "350BT"
+    subset_key = subset.replace("sample-", "")  # "10BT", "100BT", "350BT"
     paths = []
     for item in list_repo_tree(FINEWEB_REPO, repo_type="dataset", recursive=True):
         p = item.path if hasattr(item, "path") else str(item)
@@ -392,11 +406,11 @@ def _tokenize_parquet_to_file(args) -> tuple[str, int]:
     import pyarrow.parquet as pq
 
     out_path = str(parquet_path) + ".tok.bin"
-    tok   = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+    tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
     table = pq.read_table(parquet_path, columns=["text"])
     texts = table.column("text").to_pylist()
     total = 0
-    CHUNK = 10_000   # docs per flush to keep memory low
+    CHUNK = 10_000  # docs per flush to keep memory low
 
     with open(out_path, "wb") as f:
         buf: list[int] = []
@@ -408,7 +422,7 @@ def _tokenize_parquet_to_file(args) -> tuple[str, int]:
                 arr = np.array(buf, dtype=np.uint16)
                 arr.tofile(f)
                 total += len(arr)
-                buf   = []
+                buf = []
 
     return out_path, total
 
@@ -438,14 +452,14 @@ def prepare_dataset(
     """
     import pyarrow.parquet as pq
 
-    data_dir   = Path(data_dir)
+    data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     train_path = data_dir / "train.bin"
-    eval_path  = data_dir / "eval.bin"
+    eval_path = data_dir / "eval.bin"
 
     if train_path.exists() and eval_path.exists() and not force:
         train_tok = len(np.memmap(train_path, dtype=DTYPE, mode="r"))
-        eval_tok  = len(np.memmap(eval_path,  dtype=DTYPE, mode="r"))
+        eval_tok = len(np.memmap(eval_path, dtype=DTYPE, mode="r"))
         if max_train_tokens is None or train_tok >= max_train_tokens:
             print(
                 f"[fineweb_loader] Cache exists — "
@@ -461,7 +475,7 @@ def prepare_dataset(
         )
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
-    eos_id    = tokenizer.eos_token_id or 0
+    eos_id = tokenizer.eos_token_id or 0
 
     # ── Step 1: list shards ──────────────────────────────────────────────────
     subset = _select_subset(max_train_tokens)
@@ -487,7 +501,7 @@ def prepare_dataset(
     #   sample-350BT ~100M tokens/shard
     # +2 buffer to avoid off-by-one at boundary.
     _SHARD_SIZE_EST = {
-        "sample-10BT":  100_000_000,
+        "sample-10BT": 100_000_000,
         "sample-100BT": 730_000_000,
         "sample-350BT": 100_000_000,
     }
@@ -495,8 +509,7 @@ def prepare_dataset(
     if max_train_tokens is None:
         n_shards = len(all_shards)
     else:
-        n_shards = min(len(all_shards),
-                       max_train_tokens // tokens_per_shard + 2)
+        n_shards = min(len(all_shards), max_train_tokens // tokens_per_shard + 2)
 
     budget_str = f"{max_train_tokens/1e6:.0f}M" if max_train_tokens else "all"
     print(
@@ -505,7 +518,7 @@ def prepare_dataset(
     )
 
     # ── Step 3: parallel download ────────────────────────────────────────────
-    raw_dir     = data_dir / "raw"
+    raw_dir = data_dir / "raw"
     local_files = _download_shards_parallel(
         all_shards[:n_shards], raw_dir, max_workers=dl_workers
     )
@@ -528,7 +541,10 @@ def prepare_dataset(
             for i, (tmp_path, n_tok) in enumerate(
                 pool.imap(_tokenize_parquet_to_file, jobs), 1
             ):
-                print(f"  [{i}/{len(jobs)}] {n_tok/1e6:.1f}M tokens → {tmp_path}", flush=True)
+                print(
+                    f"  [{i}/{len(jobs)}] {n_tok/1e6:.1f}M tokens → {tmp_path}",
+                    flush=True,
+                )
     else:
         print(
             f"[fineweb_loader] All {len(local_files)} .tok.bin files already exist — "
@@ -551,7 +567,7 @@ def prepare_dataset(
     tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
     pf0 = pq.ParquetFile(local_files[0])
 
-    eval_ids:  list[int] = []
+    eval_ids: list[int] = []
     docs_seen: int = 0
     for batch in pf0.iter_batches(batch_size=1_000, columns=["text"]):
         for text in batch.column("text").to_pylist():
@@ -575,10 +591,9 @@ def prepare_dataset(
         for shard_i, (tok_f, n_tok) in enumerate(zip(tok_files, tok_counts)):
             data = np.fromfile(tok_f, dtype=DTYPE)
             if shard_i == 0:
-                data = data[eval_token_count:]   # skip the eval head
+                data = data[eval_token_count:]  # skip the eval head
             remaining = (
-                max_train_tokens - total_train
-                if max_train_tokens else len(data)
+                max_train_tokens - total_train if max_train_tokens else len(data)
             )
             data = data[:remaining]
             out_f.write(data.tobytes())
@@ -605,6 +620,7 @@ def prepare_dataset(
 # 3.  OLM-NATIVE STREAMING LOADER  (second preference)
 # ---------------------------------------------------------------------------
 
+
 def _build_olm_dataloaders(
     tokenizer: PreTrainedTokenizerBase,
     seq_len: int,
@@ -618,11 +634,16 @@ def _build_olm_dataloaders(
 
     def _make_hf_dataset(skip=None, take=None, shuffle=False):
         common = dict(
-            name=subset, tokenizer=tokenizer,
-            context_length=seq_len, streaming=True, shuffle=shuffle,
+            name=subset,
+            tokenizer=tokenizer,
+            context_length=seq_len,
+            streaming=True,
+            shuffle=shuffle,
         )
-        if skip is not None: common["skip"] = skip
-        if take is not None: common["take"] = take
+        if skip is not None:
+            common["skip"] = skip
+        if take is not None:
+            common["take"] = take
         for kwarg in ("path", "repo_id", "dataset_path", "dataset"):
             try:
                 return HuggingFaceTextDataset(**{kwarg: FINEWEB_REPO}, **common)
@@ -632,11 +653,15 @@ def _build_olm_dataloaders(
 
     train_dl = OLMDataLoader(
         _make_hf_dataset(skip=EVAL_DOCS, shuffle=True),
-        batch_size=batch_size, num_workers=num_workers, distributed=distributed,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        distributed=distributed,
     )
     eval_dl = OLMDataLoader(
         _make_hf_dataset(take=EVAL_DOCS, shuffle=False),
-        batch_size=batch_size, num_workers=num_workers, distributed=False,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        distributed=False,
     )
     return train_dl, eval_dl
 
@@ -644,6 +669,7 @@ def _build_olm_dataloaders(
 # ---------------------------------------------------------------------------
 # 4.  HAND-ROLLED STREAMING FALLBACK  (last resort)
 # ---------------------------------------------------------------------------
+
 
 def _doc_stream(
     skip: int = 0,
@@ -653,8 +679,8 @@ def _doc_stream(
     subset: str = "sample-10BT",
 ) -> Iterator[str]:
     from datasets import load_dataset
-    ds      = load_dataset(FINEWEB_REPO, name=subset,
-                           split="train", streaming=True)
+
+    ds = load_dataset(FINEWEB_REPO, name=subset, split="train", streaming=True)
     yielded = 0
     shard_i = 0
     for abs_i, ex in enumerate(ds):
@@ -690,28 +716,33 @@ def _tokenize_and_pack(
 class _FallbackTrainDataset(IterableDataset):
     def __init__(self, tokenizer, seq_len, rank=0, world_size=1, subset="sample-10BT"):
         super().__init__()
-        self.tokenizer  = tokenizer
-        self.seq_len    = seq_len
-        self.rank       = rank
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self.rank = rank
         self.world_size = world_size
-        self.subset     = subset
+        self.subset = subset
 
     def __iter__(self):
         wi = torch.utils.data.get_worker_info()
         if wi is not None:
             eff_rank = self.rank * wi.num_workers + wi.id
-            eff_ws   = self.world_size * wi.num_workers
+            eff_ws = self.world_size * wi.num_workers
         else:
             eff_rank = self.rank
-            eff_ws   = self.world_size
+            eff_ws = self.world_size
 
-        retry_delay = 5   # seconds before reconnecting after a network error
+        retry_delay = 5  # seconds before reconnecting after a network error
         while True:
             try:
                 yield from _tokenize_and_pack(
-                    _doc_stream(skip=EVAL_DOCS, rank=eff_rank, world_size=eff_ws,
-                                subset=self.subset),
-                    self.tokenizer, self.seq_len,
+                    _doc_stream(
+                        skip=EVAL_DOCS,
+                        rank=eff_rank,
+                        world_size=eff_ws,
+                        subset=self.subset,
+                    ),
+                    self.tokenizer,
+                    self.seq_len,
                 )
             except Exception as e:
                 # Reconnect on transient network/connection errors so that a
@@ -719,17 +750,20 @@ class _FallbackTrainDataset(IterableDataset):
                 # The stream restarts from the beginning (fine since it loops
                 # infinitely and the training step counter is authoritative).
                 err_str = str(e).lower()
-                is_net_err = any(k in err_str for k in (
-                    "client has been closed",
-                    "connection reset",
-                    "connection error",
-                    "connection refused",
-                    "broken pipe",
-                    "errno 104",
-                    "errno 110",
-                    "cannot send a request",
-                    "remote end closed",
-                ))
+                is_net_err = any(
+                    k in err_str
+                    for k in (
+                        "client has been closed",
+                        "connection reset",
+                        "connection error",
+                        "connection refused",
+                        "broken pipe",
+                        "errno 104",
+                        "errno 110",
+                        "cannot send a request",
+                        "remote end closed",
+                    )
+                )
                 if is_net_err:
                     print(
                         f"[fineweb_loader] worker {eff_rank}/{eff_ws} "
@@ -737,17 +771,19 @@ class _FallbackTrainDataset(IterableDataset):
                         flush=True,
                     )
                     time.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 2, 60)  # exponential backoff, cap 60s
+                    retry_delay = min(
+                        retry_delay * 2, 60
+                    )  # exponential backoff, cap 60s
                     continue
-                raise   # non-network errors bubble up as before
+                raise  # non-network errors bubble up as before
 
 
 class _FallbackEvalDataset(IterableDataset):
     def __init__(self, tokenizer, seq_len, subset="sample-10BT"):
         super().__init__()
         self.tokenizer = tokenizer
-        self.seq_len   = seq_len
-        self.subset    = subset
+        self.seq_len = seq_len
+        self.subset = subset
 
     def __iter__(self):
         retry_delay = 5
@@ -755,15 +791,22 @@ class _FallbackEvalDataset(IterableDataset):
             try:
                 yield from _tokenize_and_pack(
                     _doc_stream(skip=0, take=EVAL_DOCS, subset=self.subset),
-                    self.tokenizer, self.seq_len,
+                    self.tokenizer,
+                    self.seq_len,
                 )
                 return  # eval dataset is finite — exit after one pass
             except Exception as e:
                 err_str = str(e).lower()
-                if any(k in err_str for k in (
-                    "client has been closed", "connection reset", "broken pipe",
-                    "cannot send a request", "errno 104",
-                )):
+                if any(
+                    k in err_str
+                    for k in (
+                        "client has been closed",
+                        "connection reset",
+                        "broken pipe",
+                        "cannot send a request",
+                        "errno 104",
+                    )
+                ):
                     print(
                         f"[fineweb_loader] eval stream error ({e!r}); "
                         f"retrying in {retry_delay}s …",
@@ -778,6 +821,7 @@ class _FallbackEvalDataset(IterableDataset):
 # ---------------------------------------------------------------------------
 # Public factory
 # ---------------------------------------------------------------------------
+
 
 def build_dataloaders(
     tokenizer: PreTrainedTokenizerBase,
@@ -808,14 +852,14 @@ def build_dataloaders(
     target_tokens selects the FineWeb subset for streaming
     (sample-10BT / sample-100BT / sample-350BT).
     """
-    is_main = (rank == 0)
-    subset  = _select_subset(target_tokens)
+    is_main = rank == 0
+    subset = _select_subset(target_tokens)
 
     # ── 1. Local binary cache (train.bin / eval.bin) ─────────────────────────
     if data_dir is not None:
-        data_dir   = Path(data_dir)
+        data_dir = Path(data_dir)
         train_path = data_dir / "train.bin"
-        eval_path  = data_dir / "eval.bin"
+        eval_path = data_dir / "eval.bin"
         if train_path.exists() and eval_path.exists():
             n = len(np.memmap(train_path, dtype=DTYPE, mode="r"))
             cache_ok = (target_tokens is None) or (n >= target_tokens)
@@ -835,7 +879,11 @@ def build_dataloaders(
                     )
             if cache_ok:
                 return _build_local_dataloaders(
-                    data_dir, seq_len, batch_size, num_workers, distributed,
+                    data_dir,
+                    seq_len,
+                    batch_size,
+                    num_workers,
+                    distributed,
                 )
         elif is_main:
             print(
@@ -849,14 +897,13 @@ def build_dataloaders(
         tok_files = _find_tok_bin_files(data_dir)
         if tok_files:
             # Estimate total tokens from file sizes (memmap is instant — no I/O)
-            total_tok = sum(
-                len(np.memmap(f, dtype=DTYPE, mode="r")) for f in tok_files
-            )
+            total_tok = sum(len(np.memmap(f, dtype=DTYPE, mode="r")) for f in tok_files)
             eval_path = data_dir / "eval.bin"
             # Skip eval tokens at the head of shard 0 so they aren't used for training
             skip_head = (
                 len(np.memmap(eval_path, dtype=DTYPE, mode="r"))
-                if eval_path.exists() else 0
+                if eval_path.exists()
+                else 0
             )
             if is_main:
                 print(
@@ -866,9 +913,15 @@ def build_dataloaders(
                     flush=True,
                 )
             return _build_tok_bin_dataloaders(
-                tok_files, eval_path if eval_path.exists() else None,
-                seq_len, batch_size, num_workers, distributed,
-                rank, world_size, skip_head_tokens=skip_head,
+                tok_files,
+                eval_path if eval_path.exists() else None,
+                seq_len,
+                batch_size,
+                num_workers,
+                distributed,
+                rank,
+                world_size,
+                skip_head_tokens=skip_head,
             )
 
     # ── 1c. Local parquet files — tokenise on-the-fly, no network ────────────
@@ -884,26 +937,36 @@ def build_dataloaders(
                 )
             tok_name = getattr(tokenizer, "name_or_path", "EleutherAI/pythia-70m")
             train_ds = _LocalParquetStreamDataset(
-                parquet_files, tok_name, seq_len,
+                parquet_files,
+                tok_name,
+                seq_len,
                 skip_docs=EVAL_DOCS,
-                rank=rank, world_size=world_size,
+                rank=rank,
+                world_size=world_size,
             )
             if eval_path.exists():
                 eval_ds = _LocalBinDataset(eval_path, seq_len)
             else:
                 eval_ds = _LocalParquetStreamDataset(
-                    parquet_files[:1], tok_name, seq_len,
+                    parquet_files[:1],
+                    tok_name,
+                    seq_len,
                     skip_docs=0,
-                    rank=0, world_size=1,
+                    rank=0,
+                    world_size=1,
                 )
             train_dl = DataLoader(
-                train_ds, batch_size=batch_size,
-                num_workers=num_workers, pin_memory=True,
+                train_ds,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                pin_memory=True,
                 persistent_workers=(num_workers > 0),
             )
             eval_dl = DataLoader(
-                eval_ds, batch_size=batch_size,
-                num_workers=0, pin_memory=True,
+                eval_ds,
+                batch_size=batch_size,
+                num_workers=0,
+                pin_memory=True,
             )
             return train_dl, eval_dl
 
@@ -929,8 +992,12 @@ def build_dataloaders(
     # ── 2. OLM-native streaming ──────────────────────────────────────────────
     try:
         loaders = _build_olm_dataloaders(
-            tokenizer=tokenizer, seq_len=seq_len, batch_size=batch_size,
-            num_workers=num_workers, distributed=distributed, subset=subset,
+            tokenizer=tokenizer,
+            seq_len=seq_len,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            distributed=distributed,
+            subset=subset,
         )
         if is_main:
             print(
@@ -950,14 +1017,24 @@ def build_dataloaders(
     # num_workers > 0 is safe here: _FallbackTrainDataset.__iter__ shards by
     # (rank * num_workers + worker_id) so each worker gets a unique doc slice.
     train_ds = _FallbackTrainDataset(
-        tokenizer, seq_len, rank=rank, world_size=world_size, subset=subset,
+        tokenizer,
+        seq_len,
+        rank=rank,
+        world_size=world_size,
+        subset=subset,
     )
-    eval_ds  = _FallbackEvalDataset(tokenizer, seq_len, subset=subset)
+    eval_ds = _FallbackEvalDataset(tokenizer, seq_len, subset=subset)
     train_dl = DataLoader(
-        train_ds, batch_size=batch_size, num_workers=num_workers, pin_memory=True,
+        train_ds,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=True,
     )
-    eval_dl  = DataLoader(
-        eval_ds, batch_size=batch_size, num_workers=0, pin_memory=True,
+    eval_dl = DataLoader(
+        eval_ds,
+        batch_size=batch_size,
+        num_workers=0,
+        pin_memory=True,
     )
     return train_dl, eval_dl
 
@@ -966,13 +1043,15 @@ def build_dataloaders(
 # Utility
 # ---------------------------------------------------------------------------
 
+
 def estimate_total_batches(
     target_tokens: int,
     seq_len: int,
     batch_size: int,
     world_size: int = 1,
+    accum_steps: int = 1,
 ) -> int:
-    tokens_per_global_step = batch_size * world_size * seq_len
+    tokens_per_global_step = batch_size * world_size * accum_steps * seq_len
     return (target_tokens + tokens_per_global_step - 1) // tokens_per_global_step
 
 
@@ -983,30 +1062,44 @@ def estimate_total_batches(
 if __name__ == "__main__":
     p = argparse.ArgumentParser(
         description="Pre-tokenise FineWeb sample-10BT to local binary files.\n"
-                    "Downloads only the shards needed (parallel), then tokenises\n"
-                    "in parallel — much faster than streaming.",
+        "Downloads only the shards needed (parallel), then tokenises\n"
+        "in parallel — much faster than streaming.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--data_dir",          required=True,
-                   help="Output directory for train.bin / eval.bin")
-    p.add_argument("--tokenizer",         default="EleutherAI/pythia-70m")
-    p.add_argument("--num_proc",          type=int, default=mp.cpu_count(),
-                   help="Tokenisation workers (default: all CPUs)")
-    p.add_argument("--dl_workers",        type=int, default=8,
-                   help="Parallel shard download threads (default: 8)")
-    p.add_argument("--max_train_tokens",  type=int, default=None,
-                   help="Stop after N train tokens, e.g. 600000000. "
-                        "Omit to tokenise the full ~10B-token dataset.")
-    p.add_argument("--force",             action="store_true",
-                   help="Rebuild even if .bin files already exist")
+    p.add_argument(
+        "--data_dir", required=True, help="Output directory for train.bin / eval.bin"
+    )
+    p.add_argument("--tokenizer", default="EleutherAI/pythia-70m")
+    p.add_argument(
+        "--num_proc",
+        type=int,
+        default=mp.cpu_count(),
+        help="Tokenisation workers (default: all CPUs)",
+    )
+    p.add_argument(
+        "--dl_workers",
+        type=int,
+        default=8,
+        help="Parallel shard download threads (default: 8)",
+    )
+    p.add_argument(
+        "--max_train_tokens",
+        type=int,
+        default=None,
+        help="Stop after N train tokens, e.g. 600000000. "
+        "Omit to tokenise the full ~10B-token dataset.",
+    )
+    p.add_argument(
+        "--force", action="store_true", help="Rebuild even if .bin files already exist"
+    )
     args = p.parse_args()
 
     train_p, eval_p = prepare_dataset(
-        data_dir         = args.data_dir,
-        tokenizer_name   = args.tokenizer,
-        num_proc         = args.num_proc,
-        max_train_tokens = args.max_train_tokens,
-        dl_workers       = args.dl_workers,
-        force            = args.force,
+        data_dir=args.data_dir,
+        tokenizer_name=args.tokenizer,
+        num_proc=args.num_proc,
+        max_train_tokens=args.max_train_tokens,
+        dl_workers=args.dl_workers,
+        force=args.force,
     )
     print(f"\nDone.\n  train → {train_p}\n  eval  → {eval_p}")

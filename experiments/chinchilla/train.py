@@ -42,6 +42,7 @@ import csv
 import os
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional
 
@@ -546,11 +547,15 @@ def train_model(
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if is_main:
+        effective_batch = args.batch_size * world_size * args.accum_steps
+        batch_desc = f"{args.batch_size} × {world_size}"
+        if args.accum_steps > 1:
+            batch_desc += f" × {args.accum_steps} accum"
         print(
             f"[{cfg.name}] Parameters: {n_params:,} ({n_params/1e6:.1f}M) | "
             f"GPUs: {world_size} | "
-            f"Global batch: {args.batch_size} × {world_size} = "
-            f"{args.batch_size * world_size} seqs/step",
+            f"Global batch: {batch_desc} = "
+            f"{effective_batch} seqs/step",
             flush=True,
         )
 
@@ -566,8 +571,10 @@ def train_model(
     # --- OLM AdamW + cosine-warmup scheduler --------------------------------
     # Cosine decay to 10% of peak LR (Chinchilla/LLaMA convention).
     # Cycle length = total training steps (Chinchilla Fig A1: overshooting hurts).
+    accum_steps = args.accum_steps
     total_steps = estimate_total_batches(
-        cfg.target_tokens, args.seq_len, args.batch_size, world_size
+        cfg.target_tokens, args.seq_len, args.batch_size, world_size,
+        accum_steps=accum_steps,
     )
     optimizer = _build_optimizer(model, lr=cfg.lr)
     scheduler = get_cosine_schedule_with_warmup_and_min_lr(
@@ -633,7 +640,8 @@ def train_model(
     fwd_flops_per_token_per_layer = 23 * d * d + 4 * transformer_L * d
     train_flops_per_token_per_layer = 3 * fwd_flops_per_token_per_layer
     flops_per_seq          = cfg.n_layers * transformer_L * train_flops_per_token_per_layer
-    seqs_per_global_step   = args.batch_size * world_size
+    seqs_per_micro_step    = args.batch_size * world_size
+    seqs_per_global_step   = seqs_per_micro_step * accum_steps
     tokens_per_global_step = seqs_per_global_step * args.seq_len
     flops_per_global_step  = seqs_per_global_step * flops_per_seq
 
@@ -664,9 +672,10 @@ def train_model(
     train_iter = iter(train_dl)
 
     if is_main:
+        accum_info = f" (accum {accum_steps}×{seqs_per_micro_step} seqs)" if accum_steps > 1 else ""
         print(
             f"[{cfg.name}] Starting: {total_steps:,} steps × "
-            f"{tokens_per_global_step:,} tokens/step "
+            f"{tokens_per_global_step:,} tokens/step{accum_info} "
             f"= {cfg.target_tokens/1e9:.1f}B tokens",
             flush=True,
         )
@@ -675,38 +684,50 @@ def train_model(
     torch.cuda.reset_peak_memory_stats(device)
     t0 = time.time()
 
+    use_no_sync = world_size > 1 and accum_steps > 1
+    no_sync_ctx = ddp_model.no_sync if use_no_sync else None
+
     while step < total_steps:
-        try:
-            batch = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_dl)
-            batch = next(train_iter)
-
-        # OLM DataLoader may return dicts; handle both cases
-        if isinstance(batch, dict):
-            input_ids = batch["input_ids"].to(device)
-        else:
-            input_ids = batch.to(device)
-
         optimizer.zero_grad(set_to_none=True)
+        micro_loss_sum = 0.0
 
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16,
-                            enabled=use_amp):
-            if is_averaged:
-                loss, _ = ddp_model(input_ids)
+        for _micro in range(accum_steps):
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_dl)
+                batch = next(train_iter)
+
+            if isinstance(batch, dict):
+                input_ids = batch["input_ids"].to(device)
             else:
-                logits = ddp_model(input_ids)
-                labels = input_ids[:, 1:].contiguous()
-                logits = logits[:, :-1].contiguous()
-                loss = torch.nn.functional.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)),
-                    labels.reshape(-1),
-                )
+                input_ids = batch.to(device)
 
-        loss.backward()
+            # Skip DDP gradient sync on all but the last micro-batch
+            sync_ctx = no_sync_ctx() if (no_sync_ctx and _micro < accum_steps - 1) else nullcontext()
+
+            with sync_ctx:
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16,
+                                    enabled=use_amp):
+                    if is_averaged:
+                        loss, _ = ddp_model(input_ids)
+                    else:
+                        logits = ddp_model(input_ids)
+                        labels = input_ids[:, 1:].contiguous()
+                        logits = logits[:, :-1].contiguous()
+                        loss = torch.nn.functional.cross_entropy(
+                            logits.reshape(-1, logits.size(-1)),
+                            labels.reshape(-1),
+                        )
+
+                (loss / accum_steps).backward()
+            micro_loss_sum = micro_loss_sum + loss.detach()
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         scheduler.step()
+
+        loss = micro_loss_sum / accum_steps
 
         step             += 1
         tokens_seen      += tokens_per_global_step
@@ -921,6 +942,9 @@ def parse_args() -> argparse.Namespace:
                         "or files are missing, falls back to HF streaming.")
     p.add_argument("--tokenizer_name",   type=str,
                    default="EleutherAI/pythia-70m")
+    p.add_argument("--accum_steps",      type=int, default=1,
+                   help="Gradient accumulation steps. Effective global batch "
+                        "= batch_size × world_size × accum_steps.")
     p.add_argument("--resume",           action="store_true")
     p.add_argument("--results_dir",      type=str, default=None)
     p.add_argument("--early_stop_eval_loss", type=float, default=None,
