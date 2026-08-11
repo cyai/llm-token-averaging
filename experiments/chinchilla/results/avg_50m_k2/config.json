@@ -1,0 +1,34 @@
+{
+  "run_name": "avg_50m_k2",
+  "results_tag": "canonical",
+  "hf_repo_id": "FAIRC/token-averaging-avg_50m_k2",
+  "checkpoint_format": {
+    "keys": [
+      "step",
+      "tokens_seen",
+      "cumulative_flops",
+      "model",
+      "optimizer",
+      "scheduler"
+    ],
+    "note": "Raw torch.save dict from experiments/chinchilla/train.py. Load with torch.load(..., map_location='cpu', weights_only=False) and take state['model']. Not a transformers AutoModel checkpoint."
+  },
+  "model_config": {
+    "name": "avg_50m_k2",
+    "d_model": 512,
+    "n_heads": 8,
+    "n_layers": 8,
+    "context_len": 1024,
+    "averaging_k": 2,
+    "method_name": null,
+    "multi_token_phase_ratio": 0.0,
+    "tie_embeddings": true,
+    "grad_checkpoint": false,
+    "color": "#3fb950",
+    "label": "~50M + 2\u00d7 averaging",
+    "target_tokens": 2000000000,
+    "lr": 0.0002,
+    "warmup_steps": 2000,
+    "n_params_approx": 50897408
+  }
+}

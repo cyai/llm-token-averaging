@@ -1,0 +1,7 @@
+\beamer@sectionintoc {1}{Idea and hypothesis}{3}{0}{1}
+\beamer@sectionintoc {2}{Experimental setup}{5}{0}{2}
+\beamer@sectionintoc {3}{Results so far}{8}{0}{3}
+\beamer@sectionintoc {4}{What went wrong along the way}{20}{0}{4}
+\beamer@sectionintoc {5}{The evaluation problem and two fixes}{21}{0}{5}
+\beamer@sectionintoc {6}{Pooling ablations}{25}{0}{6}
+\beamer@sectionintoc {7}{Plan}{36}{0}{7}

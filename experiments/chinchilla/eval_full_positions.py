@@ -40,7 +40,7 @@ Usage
         --ckpts  experiments/chinchilla/results/model1_125m/checkpoints/final.pt \
                  experiments/chinchilla/results/avg_125m_k2/checkpoints/final.pt \
         --data_dir /data/fineweb --seq_len 1024 --batch_size 16 \
-        --out results/eval_full_positions.json > results/eval_full_positions.log 2>&1 &
+        --out experiments/chinchilla/results/eval_full_positions.json > eval_full_positions.log 2>&1 &
 
     # single model
     python experiments/chinchilla/eval_full_positions.py \

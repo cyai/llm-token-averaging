@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "derivation",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "7123", "--directory", "experiments/chinchilla"],
+      "port": 7123
+    }
+  ]
+}
