@@ -47,18 +47,12 @@ export NCCL_BUFFSIZE=16777216  # 16 MB (default 4 MB)
 # Timeout: 10 minutes (default 30 min is too long to detect real hangs)
 export NCCL_TIMEOUT=600000
 
-# Use all available network interfaces
-export NCCL_SOCKET_IFNAME=eth0,eno1,enp
 
 # ── CUDA tuning ──
 # Allow TF32 for matmuls (A6000 Ampere supports it, gives ~2x over FP32)
 export NVIDIA_TF32_OVERRIDE=1
 
-# Pre-allocate CUDA memory to avoid fragmentation
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
 # ── Data loading ──
-# Increase shared memory for DataLoader workers
 export OMP_NUM_THREADS=1
 
 # ────────────────────────────────────────────────────────────────────────
