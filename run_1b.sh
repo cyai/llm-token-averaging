@@ -96,19 +96,19 @@ log "model1_1b done. Sleeping 2 min before k=2..."
 sleep 120
 
 # ── k=2: 40B tokens ──────────────────────────────────────────────────────
-log "Starting 1B k=2 (2× averaging, 40B tokens)..."
-torchrun --standalone --nproc_per_node=$NPROC \
-  experiments/chinchilla/train.py \
-  --model avg_1b_k2 \
-  --batch_size $BATCH \
-  --seq_len $SEQ_LEN \
-  --log_steps $LOG_STEPS \
-  --eval_batches $EVAL_BATCHES \
-  --num_workers $NUM_WORKERS \
-  --data_dir $DATA_DIR \
-  --checkpoint_steps $CKPT_STEPS \
-  --keep_last_checkpoints $KEEP_CKPTS \
-  --resume
+# log "Starting 1B k=2 (2× averaging, 40B tokens)..."
+# torchrun --standalone --nproc_per_node=$NPROC \
+#   experiments/chinchilla/train.py \
+#   --model avg_1b_k2 \
+#   --batch_size $BATCH \
+#   --seq_len $SEQ_LEN \
+#   --log_steps $LOG_STEPS \
+#   --eval_batches $EVAL_BATCHES \
+#   --num_workers $NUM_WORKERS \
+#   --data_dir $DATA_DIR \
+#   --checkpoint_steps $CKPT_STEPS \
+#   --keep_last_checkpoints $KEEP_CKPTS \
+#   --resume
 
-log "avg_1b_k2 done."
-log "=== All 1B runs complete ==="
+# log "avg_1b_k2 done."
+# log "=== All 1B runs complete ==="
