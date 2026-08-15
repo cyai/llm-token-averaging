@@ -3,60 +3,112 @@ set -e
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
 
-# ── 1B Config A runs on 1× H100 SXM (80 GB) ────────────────────────────
+# ── 1B Config A runs on 8× A6000 (48 GB each) ────────────────────────────
 #
 # Architecture: d=1664, h=26, l=28, head_dim=64  (975,945,984 tied params)
-#   Continues the ladder invariants: head_dim=64 everywhere, d/n_layers≈59
-#   (500M sat at 58.2). d=1664 is divisible by 128 for tensor-core alignment.
 # LR: 1.1e-4  (2e-4 × sqrt(512/1664))
 #
-# Benchmarked batch sizes on H100 SXM 80 GB (grad_checkpoint=True):
-#   batch  8  → 37k tok/s, 24.6% MFU, 39.5 GB VRAM
-#   batch 16  → 41k tok/s, 27.3% MFU, 64.9 GB VRAM
-#   batch 32  → OOM (84.1 GB requested)
+# Memory budget per GPU (48 GB):
+#   Model params (bf16):    ~2.0 GB
+#   Optimizer (fp32 + mom): ~8.0 GB
+#   Gradients (bf16):       ~2.0 GB
+#   Fixed overhead:        ~12.0 GB
+#   Remaining for acts:    ~36.0 GB (with grad_checkpoint)
 #
-# Global batch = 16 × 2 accum = 32 seqs = 32,768 raw tokens/step,
-# IDENTICAL to the 500M protocol (16×2 GPUs on H100s).
-# Gradient accumulation (--accum_steps 2) gives the same effective batch
-# as two micro-batches of 16, keeping the optimizer trajectory identical.
+# batch_size=4 per GPU (conservative, ~30 GB activations with grad_ckpt)
+# Global batch = 4 × 8 GPUs = 32 seqs/step = 32,768 raw tokens/step
+# Same global batch as the 500M protocol — no gradient accumulation needed.
 #
-# k=1:  20B raw tokens, L=1024  →   610,351 steps  (D/N = 20.5)
-# k=2:  40B raw tokens, L= 512  → 1,220,703 steps  (D/N = 41.0)
+# k=1:  20B raw tokens, L=1024  →   610,351 steps
+# k=2:  40B raw tokens, L= 512  → 1,220,703 steps
 #
-# grad_checkpoint=True in the config. Peak VRAM ≈ 65 GB at batch 16.
+# ⏱  Expected throughput:
+#    8× A6000 at ~40% MFU ≈ 8 × 310 TFLOPS × 0.40 = 992 effective TFLOPS
+#    FLOPs/token ≈ 6 × 976M = 5.86 TFLOPS per token (fwd+bwd)
+#    TPS ≈ 992 / 5.86e-3 ≈ 169k tok/s → ~1.4 days for k=1
+#    (Real-world with comm overhead: ~100-130k tok/s → 1.8-2.3 days for k=1)
 #
-# Checkpoints are ~12 GB each at 1B. --keep_last_checkpoints 3 caps the
-# checkpoint dir at ~36 GB/run; saves are atomic.
-#
-# ⚠  DATA: the k=2 arm needs 40B raw tokens. Pre-tokenize before launching:
+# ⚠  DATA: pre-tokenize 40B tokens before launching k=2:
 #      python experiments/chinchilla/fineweb_loader.py \
 #        --data_dir /data/fineweb --max_train_tokens 40000000000 --num_proc 16
-#    That selects FineWeb sample-100BT (~56 shards) and needs ~80 GB for
-#    train.bin plus room for the raw parquets.
-#
-# ⏱  Wall-time estimate at ~41k tok/s (benchmarked):
-#    k=1:  20B / 41k ≈  5.6 days
-#    k=2:  40B / 41k ≈ 11.3 days
-#    Run under tmux.
 # ────────────────────────────────────────────────────────────────────────
 
-log "Starting 1B k=1 (standard, 20B tokens) on 1× H100..."
-python experiments/chinchilla/train.py \
+# ── NCCL tuning for 8× A6000 ──
+# Disable P2P if GPUs are on different PCIe root complexes (common on multi-GPU
+# servers without NVLink). Prevents hangs from failed P2P reads.
+export NCCL_P2P_DISABLE=1
+
+# Force tree reduction (better for 8 GPUs without NVLink)
+export NCCL_ALGO=Tree
+
+# Increase buffer size for large allreduce (1B model has big gradients)
+export NCCL_BUFFSIZE=16777216  # 16 MB (default 4 MB)
+
+# Timeout: 10 minutes (default 30 min is too long to detect real hangs)
+export NCCL_TIMEOUT=600000
+
+# Use all available network interfaces
+export NCCL_SOCKET_IFNAME=eth0,eno1,enp
+
+# ── CUDA tuning ──
+# Allow TF32 for matmuls (A6000 Ampere supports it, gives ~2x over FP32)
+export NVIDIA_TF32_OVERRIDE=1
+
+# Pre-allocate CUDA memory to avoid fragmentation
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# ── Data loading ──
+# Increase shared memory for DataLoader workers
+export OMP_NUM_THREADS=1
+
+# ────────────────────────────────────────────────────────────────────────
+
+NPROC=8
+BATCH=4
+SEQ_LEN=1024
+NUM_WORKERS=8
+LOG_STEPS=500
+EVAL_BATCHES=16
+CKPT_STEPS=25000
+KEEP_CKPTS=3
+DATA_DIR=/data/fineweb
+
+log "=== 1B training on 8× A6000 ==="
+log "Global batch: ${BATCH} × ${NPROC} = $((BATCH * NPROC)) seqs = $((BATCH * NPROC * SEQ_LEN)) tokens/step"
+log "NCCL: P2P_DISABLE=1, ALGO=Tree, BUFFSIZE=16MB"
+
+# ── k=1: 20B tokens ──────────────────────────────────────────────────────
+log "Starting 1B k=1 (standard, 20B tokens)..."
+torchrun --standalone --nproc_per_node=$NPROC \
+  experiments/chinchilla/train.py \
   --model model1_1b \
-  --batch_size 16 --accum_steps 2 \
-  --seq_len 1024 --log_steps 500 --eval_batches 16 \
-  --num_workers 8 --data_dir /data/fineweb \
-  --checkpoint_steps 50000 --keep_last_checkpoints 3 \
+  --batch_size $BATCH \
+  --seq_len $SEQ_LEN \
+  --log_steps $LOG_STEPS \
+  --eval_batches $EVAL_BATCHES \
+  --num_workers $NUM_WORKERS \
+  --data_dir $DATA_DIR \
+  --checkpoint_steps $CKPT_STEPS \
+  --keep_last_checkpoints $KEEP_CKPTS \
   --resume
-log "model1_1b done. Sleeping 2 min..."
+
+log "model1_1b done. Sleeping 2 min before k=2..."
 sleep 120
 
-log "Starting 1B k=2 (2× averaging, 40B tokens) on 1× H100..."
-python experiments/chinchilla/train.py \
+# ── k=2: 40B tokens ──────────────────────────────────────────────────────
+log "Starting 1B k=2 (2× averaging, 40B tokens)..."
+torchrun --standalone --nproc_per_node=$NPROC \
+  experiments/chinchilla/train.py \
   --model avg_1b_k2 \
-  --batch_size 16 --accum_steps 2 \
-  --seq_len 1024 --log_steps 500 --eval_batches 16 \
-  --num_workers 8 --data_dir /data/fineweb \
-  --checkpoint_steps 50000 --keep_last_checkpoints 3 \
+  --batch_size $BATCH \
+  --seq_len $SEQ_LEN \
+  --log_steps $LOG_STEPS \
+  --eval_batches $EVAL_BATCHES \
+  --num_workers $NUM_WORKERS \
+  --data_dir $DATA_DIR \
+  --checkpoint_steps $CKPT_STEPS \
+  --keep_last_checkpoints $KEEP_CKPTS \
   --resume
+
 log "avg_1b_k2 done."
+log "=== All 1B runs complete ==="
