@@ -543,7 +543,13 @@ def train_model(
     # Wrap with PyTorch DDP (OLM's DDPTrainer uses this internally as well)
     ddp_model = model
     if world_size > 1:
-        ddp_model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        ddp_model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            gradient_as_bucket_view=True,
+            bucket_cap_mb=100,
+        )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if is_main:
