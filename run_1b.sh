@@ -38,8 +38,9 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
 # servers without NVLink). Prevents hangs from failed P2P reads.
 export NCCL_P2P_DISABLE=1
 
-# Force tree reduction (better for 8 GPUs without NVLink)
-export NCCL_ALGO=Tree
+# Let NCCL auto-select the best algorithm for the topology
+# (Tree can be slower than Ring on some PCIe topologies)
+# export NCCL_ALGO=Tree
 
 # Increase buffer size for large allreduce (1B model has big gradients)
 export NCCL_BUFFSIZE=16777216  # 16 MB (default 4 MB)
@@ -58,7 +59,7 @@ export OMP_NUM_THREADS=1
 # ────────────────────────────────────────────────────────────────────────
 
 NPROC=8
-BATCH=4
+BATCH=10
 SEQ_LEN=1024
 NUM_WORKERS=8
 LOG_STEPS=500
