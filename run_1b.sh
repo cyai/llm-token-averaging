@@ -37,9 +37,9 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
 # Use GPUs 0-3 (likely same PCIe root complex for better communication)
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
-# Disable P2P if GPUs are on different PCIe root complexes (common on multi-GPU
-# servers without NVLink). Prevents hangs from failed P2P reads.
-export NCCL_P2P_DISABLE=1
+# Try P2P first (direct GPU-GPU over PCIe is much faster than host-routed).
+# If training hangs in the first 100 steps, set NCCL_P2P_DISABLE=1 and restart.
+# export NCCL_P2P_DISABLE=1
 
 # Let NCCL auto-select the best algorithm for the topology
 # (Tree can be slower than Ring on some PCIe topologies)
