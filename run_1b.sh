@@ -59,7 +59,7 @@ export OMP_NUM_THREADS=1
 # ────────────────────────────────────────────────────────────────────────
 
 NPROC=8
-BATCH=10
+BATCH=24
 SEQ_LEN=1024
 NUM_WORKERS=8
 LOG_STEPS=500
