@@ -539,12 +539,6 @@ def train_model(
 
     model.to(device)
 
-    # torch.compile for fused kernels (1.3-1.8× compute speedup)
-    if hasattr(torch, "compile"):
-        if is_main:
-            print(f"[{cfg.name}] Compiling model with torch.compile …", flush=True)
-        model = torch.compile(model)
-
     # Wrap with PyTorch DDP (OLM's DDPTrainer uses this internally as well)
     ddp_model = model
     if world_size > 1:
