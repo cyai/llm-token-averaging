@@ -73,13 +73,16 @@ CKPT_STEPS=25000
 KEEP_CKPTS=3
 DATA_DIR=/data/fineweb
 
+# Use venv's torch.distributed.run (system torchrun uses /usr/bin/python3 which lacks deps)
+TORCHRUN="python3 -m torch.distributed.run"
+
 log "=== 1B training on 8× A6000 ==="
 log "Global batch: ${BATCH} × ${NPROC} = $((BATCH * NPROC)) seqs = $((BATCH * NPROC * SEQ_LEN)) tokens/step"
 log "NCCL: P2P_DISABLE=1, ALGO=Tree, BUFFSIZE=16MB"
 
 # ── k=1: 20B tokens ──────────────────────────────────────────────────────
 log "Starting 1B k=1 (standard, 20B tokens)..."
-torchrun --standalone --nproc_per_node=$NPROC \
+$TORCHRUN --standalone --nproc_per_node=$NPROC \
   experiments/chinchilla/train.py \
   --model model1_1b \
   --batch_size $BATCH \
@@ -97,7 +100,7 @@ sleep 120
 
 # ── k=2: 40B tokens ──────────────────────────────────────────────────────
 # log "Starting 1B k=2 (2× averaging, 40B tokens)..."
-# torchrun --standalone --nproc_per_node=$NPROC \
+# $TORCHRUN --standalone --nproc_per_node=$NPROC \
 #   experiments/chinchilla/train.py \
 #   --model avg_1b_k2 \
 #   --batch_size $BATCH \
