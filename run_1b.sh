@@ -33,13 +33,13 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
 #        --data_dir /data/fineweb --max_train_tokens 40000000000 --num_proc 16
 # ────────────────────────────────────────────────────────────────────────
 
-# ── NCCL tuning for 4× A6000 ──
-# Use GPUs 0-3 (likely same PCIe root complex for better communication)
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+# ── NCCL tuning for 8× A6000 ──
+# Use all 8 GPUs
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
-# Try P2P first (direct GPU-GPU over PCIe is much faster than host-routed).
-# If training hangs in the first 100 steps, set NCCL_P2P_DISABLE=1 and restart.
-# export NCCL_P2P_DISABLE=1
+# Disable P2P — GPUs span two NUMA nodes (0-3 on socket 0, 4-7 on socket 1)
+# and P2P across sockets can hang.
+export NCCL_P2P_DISABLE=1
 
 # Let NCCL auto-select the best algorithm for the topology
 # (Tree can be slower than Ring on some PCIe topologies)
@@ -61,7 +61,7 @@ export OMP_NUM_THREADS=1
 
 # ────────────────────────────────────────────────────────────────────────
 
-NPROC=4
+NPROC=8
 BATCH=30
 SEQ_LEN=1024
 NUM_WORKERS=8
@@ -74,7 +74,7 @@ DATA_DIR=/data/fineweb
 # Use venv's torch.distributed.run (system torchrun uses /usr/bin/python3 which lacks deps)
 TORCHRUN="python3 -m torch.distributed.run"
 
-log "=== 1B training on 4× A6000 (GPUs 0-3) ==="
+log "=== 1B training on 8× A6000 ==="
 log "Global batch: ${BATCH} × ${NPROC} = $((BATCH * NPROC)) seqs = $((BATCH * NPROC * SEQ_LEN)) tokens/step"
 log "NCCL: P2P_DISABLE=1, ALGO=Tree, BUFFSIZE=16MB"
 
