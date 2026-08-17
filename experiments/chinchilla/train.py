@@ -541,6 +541,9 @@ def train_model(
 
     # torch.compile for fused kernels — requires OLM with compile support
     if hasattr(torch, "compile"):
+        # Disable DDP optimizer in dynamo — gradient checkpointing uses
+        # higher-order ops that the DDP optimizer can't split across buckets.
+        torch._dynamo.config.optimize_ddp = False
         if is_main:
             print(f"[{cfg.name}] Compiling model with torch.compile …", flush=True)
         model = torch.compile(model)
