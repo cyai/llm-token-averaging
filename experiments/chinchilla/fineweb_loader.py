@@ -112,6 +112,7 @@ def _build_local_dataloaders(
     batch_size: int,
     num_workers: int,
     distributed: bool,
+    seed: int = 0,
 ):
     from torch.utils.data import DistributedSampler
 
@@ -119,15 +120,20 @@ def _build_local_dataloaders(
     eval_ds = _LocalBinDataset(data_dir / "eval.bin", seq_len)
 
     train_sampler = (
-        DistributedSampler(train_ds, shuffle=True, drop_last=True)
+        DistributedSampler(train_ds, shuffle=True, drop_last=True, seed=seed)
         if distributed
         else None
     )
+    # Single-process shuffling draws from this generator rather than the global
+    # RNG, so the data order depends on --seed and nothing else.
+    train_gen = torch.Generator()
+    train_gen.manual_seed(seed)
     train_dl = DataLoader(
         train_ds,
         batch_size=batch_size,
         sampler=train_sampler,
         shuffle=(train_sampler is None),
+        generator=(None if train_sampler is not None else train_gen),
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=(num_workers > 0),
@@ -164,6 +170,12 @@ class _TokBinStreamDataset(IterableDataset):
     Shards at sequence level: worker slot ``eff_rank`` yields every
     ``eff_ws``-th sequence so all slots see a balanced, non-overlapping
     subset of the data regardless of the file/worker ratio.
+
+    ``seed`` rotates the sequence order within each shard by a deterministic
+    per-file amount, so that independent seed replicates traverse the corpus in
+    a different order without any extra I/O. Seed 0 reproduces the original
+    unrotated order. Leave it at 0 for eval loaders, whose order must be fixed
+    across runs.
     """
 
     def __init__(
@@ -173,6 +185,7 @@ class _TokBinStreamDataset(IterableDataset):
         skip_head_tokens: int = 0,  # skip this many tokens at the start of tok_files[0]
         rank: int = 0,
         world_size: int = 1,
+        seed: int = 0,
     ):
         super().__init__()
         self.tok_files = tok_files
@@ -180,6 +193,7 @@ class _TokBinStreamDataset(IterableDataset):
         self.skip_head_tokens = skip_head_tokens
         self.rank = rank
         self.world_size = world_size
+        self.seed = seed
 
     def __iter__(self):
         wi = torch.utils.data.get_worker_info()
@@ -194,11 +208,21 @@ class _TokBinStreamDataset(IterableDataset):
         while True:  # loop forever — training is controlled by step count
             for file_i, tok_file in enumerate(self.tok_files):
                 data = np.memmap(tok_file, dtype=DTYPE, mode="r")
+                # skip_head_tokens is keyed to the first file, so the file order
+                # is never rotated; only the sequence order within a file is.
                 start = self.skip_head_tokens if file_i == 0 else 0
                 n_seqs = (len(data) - start - 1) // self.seq_len
+                if n_seqs <= 0:
+                    continue
+                rot = (
+                    (self.seed * 7919 + file_i * 104729) % n_seqs
+                    if self.seed
+                    else 0
+                )
                 for s in range(n_seqs):
                     if global_seq % eff_ws == eff_rank:
-                        offset = start + s * self.seq_len
+                        s_rot = (s + rot) % n_seqs
+                        offset = start + s_rot * self.seq_len
                         chunk = np.array(
                             data[offset : offset + self.seq_len], dtype=np.int64
                         )
@@ -216,6 +240,7 @@ def _build_tok_bin_dataloaders(
     rank: int,
     world_size: int,
     skip_head_tokens: int = 0,
+    seed: int = 0,
 ):
     from torch.utils.data import DistributedSampler
 
@@ -225,6 +250,7 @@ def _build_tok_bin_dataloaders(
         skip_head_tokens=skip_head_tokens,
         rank=rank,
         world_size=world_size,
+        seed=seed,
     )
     train_dl = DataLoader(
         train_ds,
@@ -834,9 +860,13 @@ def build_dataloaders(
     distributed: bool = False,
     data_dir: Optional[str | Path] = None,
     target_tokens: Optional[int] = None,
+    seed: int = 0,
 ):
     """
     Build (train_dataloader, eval_dataloader) for FineWeb.
+
+    ``seed`` controls the training data order only; the eval loader is always
+    built in the same fixed order so that losses stay comparable across seeds.
 
     When data_dir is set (strict-local mode), the loader uses **only** local
     data — it never falls through to HuggingFace streaming. This avoids
@@ -884,6 +914,7 @@ def build_dataloaders(
                     batch_size,
                     num_workers,
                     distributed,
+                    seed=seed,
                 )
         elif is_main:
             print(
@@ -922,6 +953,7 @@ def build_dataloaders(
                 rank,
                 world_size,
                 skip_head_tokens=skip_head,
+                seed=seed,
             )
 
     # ── 1c. Local parquet files — tokenise on-the-fly, no network ────────────

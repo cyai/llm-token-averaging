@@ -39,7 +39,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
+import random
 import sys
 import time
 from contextlib import nullcontext
@@ -48,6 +50,7 @@ from typing import Optional
 
 import math
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -74,6 +77,20 @@ from experiments.shared.averaged_lm import build_method_config
 # ---------------------------------------------------------------------------
 
 MIN_LR_RATIO = 0.1  # η_min = 0.1 × η_max (Chinchilla 10× decay, LLaMA convention)
+
+
+# ---------------------------------------------------------------------------
+# Seeding
+# ---------------------------------------------------------------------------
+
+
+def _set_seed(seed: int) -> None:
+    """Seed every RNG this training loop draws from."""
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def get_cosine_schedule_with_warmup_and_min_lr(
@@ -411,6 +428,16 @@ def train_model(
     local_rank, global_rank, world_size = _setup_distributed()
     is_main = _is_main_process()
 
+    seed = getattr(args, "seed", 0)
+    # Every rank starts from the same seed so that model init is identical
+    # across ranks; the per-rank re-seed happens after the model is built.
+    _set_seed(seed)
+    if getattr(args, "deterministic", False):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
     device = f"cuda:{local_rank}" if world_size > 1 else args.device
 
     # Enable TF32 tensor cores for any FP32 matmuls (Ampere+, e.g. A6000).
@@ -435,6 +462,10 @@ def train_model(
     if results_dir is None:
         results_dir = _ROOT / "experiments" / "chinchilla" / "results" / cfg.name
     results_dir = Path(results_dir)
+    # Seed replicates get their own directory so they never overwrite the
+    # canonical run. Seed 0 keeps the original path.
+    if seed and not results_dir.name.endswith(f"_seed{seed}"):
+        results_dir = results_dir.with_name(f"{results_dir.name}_seed{seed}")
     ckpt_dir = results_dir / "checkpoints"
     if is_main:
         results_dir.mkdir(parents=True, exist_ok=True)
@@ -467,6 +498,7 @@ def train_model(
         distributed=(world_size > 1),
         data_dir=args.data_dir,
         target_tokens=cfg.target_tokens,
+        seed=seed,
     )
 
     # --- model --------------------------------------------------------------
@@ -559,6 +591,12 @@ def train_model(
             bucket_cap_mb=100,
         )
 
+    # Model init is done and identical across ranks. From here on each rank
+    # advances its own RNG stream, so the per-step random group offset
+    # (averaged_lm.py) and any dropout differ across ranks as they did before
+    # seeding was added.
+    _set_seed(seed + 1000 * global_rank)
+
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if is_main:
         effective_batch = args.batch_size * world_size * args.accum_steps
@@ -626,6 +664,42 @@ def train_model(
                 f"starting from scratch.",
                 flush=True,
             )
+
+    # --- run metadata (rank 0 only) -----------------------------------------
+    # Records exactly what the paper's run table needs, so the numbers do not
+    # have to be reconstructed from shell history after the fact.
+    if is_main:
+        meta = {
+            "run_name": cfg.name,
+            "seed": seed,
+            "deterministic": bool(getattr(args, "deterministic", False)),
+            "world_size": world_size,
+            "batch_size_per_rank": args.batch_size,
+            "accum_steps": accum_steps,
+            "global_batch_seqs": args.batch_size * world_size * accum_steps,
+            "raw_tokens_per_update": args.batch_size * world_size * accum_steps * args.seq_len,
+            "raw_seq_len": args.seq_len,
+            "averaging_k": cfg.averaging_k,
+            "transformer_positions_per_seq": args.seq_len // cfg.averaging_k,
+            "target_tokens": cfg.target_tokens,
+            "total_steps_planned": total_steps,
+            "warmup_steps": cfg.warmup_steps,
+            "peak_lr": cfg.lr,
+            "min_lr_ratio": MIN_LR_RATIO,
+            "grad_checkpoint": cfg.grad_checkpoint,
+            "tie_embeddings": cfg.tie_embeddings,
+            "method_name": cfg.method_name,
+            "torch_version": torch.__version__,
+            "resumed": bool(args.resume),
+        }
+        with open(results_dir / "run_meta.json", "w") as f:
+            json.dump(meta, f, indent=2)
+        print(
+            f"[{cfg.name}] seed={seed} | "
+            f"{meta['raw_tokens_per_update']:,} raw tokens/update | "
+            f"wrote run_meta.json",
+            flush=True,
+        )
 
     # --- CSV log (rank 0 only) ----------------------------------------------
     csv_file   = None
@@ -961,6 +1035,14 @@ def parse_args() -> argparse.Namespace:
                         "= batch_size × world_size × accum_steps.")
     p.add_argument("--resume",           action="store_true")
     p.add_argument("--results_dir",      type=str, default=None)
+    p.add_argument("--seed",             type=int, default=0,
+                   help="Random seed for model init, data order and the random "
+                        "group offset. Any non-zero seed writes to "
+                        "<results_dir>_seed<N> so replicates never overwrite "
+                        "the canonical run.")
+    p.add_argument("--deterministic",    action="store_true",
+                   help="Also force deterministic cuDNN/cuBLAS kernels. Costs "
+                        "throughput; not needed for seed replicates.")
     p.add_argument("--early_stop_eval_loss", type=float, default=None,
                    help="Stop training early when eval loss falls at or below "
                         "this value (e.g. 4.286754 to match avg_50m_k2_v2).")
