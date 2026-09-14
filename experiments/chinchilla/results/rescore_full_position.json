@@ -1,0 +1,444 @@
+{
+  "model1_250m": {
+    "k": 1,
+    "n_seqs": 3339,
+    "mean_nll": 3.4147001300054955,
+    "n_predictions": 3415797,
+    "restricted": {
+      "pos_ge_2": {
+        "mean_nll": 3.4119470623085437,
+        "n_predictions": 3412458
+      },
+      "pos_ge_4": {
+        "mean_nll": 3.408392651873574,
+        "n_predictions": 3405780
+      },
+      "pos_ge_8": {
+        "mean_nll": 3.4039267988605473,
+        "n_predictions": 3392424
+      }
+    },
+    "note": "250M k=1",
+    "group": "pairs",
+    "seq_len": 1024,
+    "repo": "FAIRC/token-averaging-model1_250m",
+    "ppl": 30.40782966454749,
+    "ckpt_meta": {
+      "step": 152588.0,
+      "tokens_seen": 5000003584.0,
+      "cumulative_flops": 6.794777350492914e+18
+    }
+  },
+  "avg_250m_k2": {
+    "k": 2,
+    "n_seqs": 3339,
+    "mean_nll": 3.400991090750004,
+    "n_predictions": 3409119,
+    "per_offset": {
+      "0": 3.404174324208728,
+      "1": 3.3978016156570465
+    },
+    "note": "250M k=2",
+    "group": "pairs",
+    "seq_len": 1024,
+    "repo": "FAIRC/token-averaging-avg_250m_k2",
+    "ppl": 29.993811910930667,
+    "ckpt_meta": {
+      "step": 305176.0,
+      "tokens_seen": 10000007168.0,
+      "cumulative_flops": 6.291460509715661e+18
+    }
+  },
+  "model1_500m": {
+    "k": 1,
+    "n_seqs": 3339,
+    "mean_nll": 3.070646053511312,
+    "n_predictions": 3415797,
+    "restricted": {
+      "pos_ge_2": {
+        "mean_nll": 3.0677120495731685,
+        "n_predictions": 3412458
+      },
+      "pos_ge_4": {
+        "mean_nll": 3.0637913891656865,
+        "n_predictions": 3405780
+      },
+      "pos_ge_8": {
+        "mean_nll": 3.05888467132173,
+        "n_predictions": 3392424
+      }
+    },
+    "note": "500M k=1",
+    "group": "pairs",
+    "seq_len": 1024,
+    "repo": "FAIRC/token-averaging-model1_500m",
+    "ppl": 21.555824393469262,
+    "ckpt_meta": {
+      "step": 305176.0,
+      "tokens_seen": 10000007168.0,
+      "cumulative_flops": 2.8331233107813335e+19
+    }
+  },
+  "avg_500m_k2": {
+    "k": 2,
+    "n_seqs": 3339,
+    "mean_nll": 3.0687792289716245,
+    "n_predictions": 3409119,
+    "per_offset": {
+      "0": 3.0713733649960746,
+      "1": 3.0661800064059497
+    },
+    "note": "500M k=2",
+    "group": "pairs",
+    "seq_len": 1024,
+    "repo": "FAIRC/token-averaging-avg_500m_k2",
+    "ppl": 21.515620989544708,
+    "ckpt_meta": {
+      "step": 610352.0,
+      "tokens_seen": 20000014336.0,
+      "cumulative_flops": 2.660108146764153e+19
+    }
+  },
+  "avg_50m_k2": {
+    "k": 2,
+    "n_seqs": 3339,
+    "mean_nll": 4.3575184943699865,
+    "n_predictions": 3409119,
+    "per_offset": {
+      "0": 4.360641988032804,
+      "1": 4.35438887620979
+    },
+    "note": "k=2 mean",
+    "group": "pooling",
+    "seq_len": 1024,
+    "repo": "FAIRC/token-averaging-matched_mean-avg_50m_k2",
+    "ppl": 78.06317965288078,
+    "ckpt_meta": {
+      "step": 122071.0,
+      "tokens_seen": 2000011264.0,
+      "cumulative_flops": 1.698702687039652e+17
+    }
+  },
+  "avg_50m_k2_learnable_pos": {
+    "k": 2,
+    "n_seqs": 3339,
+    "mean_nll": 4.314518915593394,
+    "n_predictions": 3409119,
+    "per_offset": {
+      "0": 4.3176101979898025,
+      "1": 4.311421571858952
+    },
+    "note": "k=2 learned: content + position",
+    "group": "pooling",
+    "seq_len": 1024,
+    "repo": "FAIRC/token-averaging-avg_50m_k2_learnable_pos",
+    "ppl": 74.77764043242921,
+    "ckpt_meta": {
+      "step": 122071.0,
+      "tokens_seen": 2000011264.0,
+      "cumulative_flops": 1.698702687039652e+17
+    }
+  },
+  "avg_50m_k2_learnable": {
+    "k": 2,
+    "n_seqs": 3339,
+    "mean_nll": 4.3659412279627,
+    "n_predictions": 3409119,
+    "per_offset": {
+      "0": 4.369423920110729,
+      "1": 4.362451707006536
+    },
+    "note": "k=2 learned: content only",
+    "group": "pooling",
+    "seq_len": 1024,
+    "repo": "FAIRC/token-averaging-avg_50m_k2_learnable",
+    "ppl": 78.72346180533246,
+    "ckpt_meta": {
+      "step": 122071.0,
+      "tokens_seen": 2000011264.0,
+      "cumulative_flops": 1.698702687039652e+17
+    }
+  },
+  "avg_50m_k2_wexp": {
+    "k": 2,
+    "n_seqs": 3339,
+    "mean_nll": 4.598143830853257,
+    "n_predictions": 3409119,
+    "per_offset": {
+      "0": 4.601502133900978,
+      "1": 4.594778942897599
+    },
+    "note": "k=2 fixed recency",
+    "group": "pooling",
+    "seq_len": 1024,
+    "repo": "FAIRC/token-averaging-avg_50m_k2_wexp",
+    "ppl": 99.29982719850184,
+    "ckpt_meta": {
+      "step": 122071.0,
+      "tokens_seen": 2000011264.0,
+      "cumulative_flops": 1.698702687039652e+17
+    }
+  },
+  "avg_50m_k2_ov4s2": {
+    "k": 2,
+    "n_seqs": 3339,
+    "mean_nll": 4.487873428362445,
+    "n_predictions": 3402441,
+    "per_offset": {
+      "0": 4.490886570558322,
+      "1": 4.484854366437301
+    },
+    "note": "k=2 overlapping w4s2",
+    "group": "pooling",
+    "seq_len": 1024,
+    "repo": "FAIRC/token-averaging-avg_50m_k2_ov4s2",
+    "ppl": 88.93212411405025,
+    "ckpt_meta": {
+      "step": 122071.0,
+      "tokens_seen": 2000011264.0,
+      "cumulative_flops": 1.698702687039652e+17
+    }
+  },
+  "avg_50m_k2_word": {
+    "k": 2,
+    "n_seqs": 3339,
+    "mean_nll": 4.575020827079282,
+    "n_predictions": 2712487,
+    "per_offset": {
+      "0": 4.574843001927924,
+      "1": 4.575198838381552
+    },
+    "note": "k=2 word-aligned (see caveat)",
+    "group": "pooling",
+    "seq_len": 1024,
+    "repo": "FAIRC/token-averaging-avg_50m_k2_word",
+    "ppl": 97.03005996864094,
+    "ckpt_meta": {
+      "step": 122071.0,
+      "tokens_seen": 2000011264.0,
+      "cumulative_flops": 1.698702687039652e+17
+    }
+  },
+  "avg_50m_k4": {
+    "k": 4,
+    "n_seqs": 3339,
+    "mean_nll": 4.4398940241376,
+    "n_predictions": 3395763,
+    "per_offset": {
+      "0": 4.441083454807278,
+      "1": 4.438952896115879,
+      "2": 4.4440730689849355,
+      "3": 4.435461993844397
+    },
+    "note": "k=4 mean",
+    "group": "pooling",
+    "seq_len": 1024,
+    "repo": "FAIRC/token-averaging-matched_mean-avg_50m_k4",
+    "ppl": 84.76595805230615,
+    "ckpt_meta": {
+      "step": 248536.0,
+      "tokens_seen": 4072013824.0,
+      "cumulative_flops": 1.601180987817984e+17
+    }
+  },
+  "avg_50m_k4_learnable_pos": {
+    "k": 4,
+    "n_seqs": 3339,
+    "mean_nll": 4.154269356331995,
+    "n_predictions": 3395763,
+    "per_offset": {
+      "0": 4.156405353231964,
+      "1": 4.150730208745078,
+      "2": 4.158763232292547,
+      "3": 4.151170221621778
+    },
+    "note": "k=4 learned: content + position",
+    "group": "pooling",
+    "seq_len": 1024,
+    "repo": "FAIRC/token-averaging-avg_50m_k4_learnable_pos",
+    "ppl": 63.70540159112936,
+    "ckpt_meta": {
+      "step": 248536.0,
+      "tokens_seen": 4072013824.0,
+      "cumulative_flops": 1.601180987817984e+17
+    }
+  },
+  "avg_50m_k4_learnable": {
+    "k": 4,
+    "n_seqs": 3339,
+    "mean_nll": 4.435378907663948,
+    "n_predictions": 3395763,
+    "per_offset": {
+      "0": 4.438337885001777,
+      "1": 4.433718450557118,
+      "2": 4.438751168720877,
+      "3": 4.430696476858938
+    },
+    "note": "k=4 learned: content only",
+    "group": "pooling",
+    "seq_len": 1024,
+    "repo": "FAIRC/token-averaging-avg_50m_k4_learnable",
+    "ppl": 84.38409261090615,
+    "ckpt_meta": {
+      "step": 248536.0,
+      "tokens_seen": 4072013824.0,
+      "cumulative_flops": 1.601180987817984e+17
+    }
+  },
+  "avg_50m_k4_wexp": {
+    "k": 4,
+    "n_seqs": 3339,
+    "mean_nll": 4.251061165652214,
+    "n_predictions": 3395763,
+    "per_offset": {
+      "0": 4.252903678239409,
+      "1": 4.249220462786505,
+      "2": 4.254391774334355,
+      "3": 4.247721493262022
+    },
+    "note": "k=4 fixed recency",
+    "group": "pooling",
+    "seq_len": 1024,
+    "repo": "FAIRC/token-averaging-avg_50m_k4_wexp",
+    "ppl": 70.17984528816014,
+    "ckpt_meta": {
+      "step": 248536.0,
+      "tokens_seen": 4072013824.0,
+      "cumulative_flops": 1.601180987817984e+17
+    }
+  },
+  "avg_50m_k8": {
+    "k": 8,
+    "n_seqs": 3339,
+    "mean_nll": 4.813952563025185,
+    "n_predictions": 3369051,
+    "per_offset": {
+      "0": 4.815363633057856,
+      "1": 4.804077530021473,
+      "2": 4.820217102150176,
+      "3": 4.809408951319774,
+      "4": 4.818363545147307,
+      "5": 4.818042639309362,
+      "6": 4.813592441069862,
+      "7": 4.812543463157158
+    },
+    "note": "k=8 mean",
+    "group": "pooling",
+    "seq_len": 1024,
+    "repo": "FAIRC/token-averaging-matched_mean-avg_50m_k8",
+    "ppl": 123.21768193800848,
+    "ckpt_meta": {
+      "step": 497071.0,
+      "tokens_seen": 8144011264.0,
+      "cumulative_flops": 1.5371306559288115e+17
+    }
+  },
+  "avg_50m_k8_learnable_pos": {
+    "k": 8,
+    "n_seqs": 3339,
+    "mean_nll": 4.092707055308393,
+    "n_predictions": 3369051,
+    "per_offset": {
+      "0": 4.09485821639681,
+      "1": 4.0843599433133475,
+      "2": 4.098277184805423,
+      "3": 4.087277348293592,
+      "4": 4.095953741270684,
+      "5": 4.095061860422989,
+      "6": 4.095202708751294,
+      "7": 4.090648366505959
+    },
+    "note": "k=8 learned: content + position",
+    "group": "pooling",
+    "seq_len": 1024,
+    "repo": "FAIRC/token-averaging-avg_50m_k8_learnable_pos",
+    "ppl": 59.901829984153714,
+    "ckpt_meta": {
+      "step": 497071.0,
+      "tokens_seen": 8144011264.0,
+      "cumulative_flops": 1.5371306559288115e+17
+    }
+  },
+  "avg_50m_k8_learnable": {
+    "k": 8,
+    "n_seqs": 3339,
+    "mean_nll": 4.810475489545911,
+    "n_predictions": 3369051,
+    "per_offset": {
+      "0": 4.8111123708808945,
+      "1": 4.801812520959699,
+      "2": 4.816315982112559,
+      "3": 4.805659291557867,
+      "4": 4.815165993124113,
+      "5": 4.813583708195031,
+      "6": 4.811117566677938,
+      "7": 4.809031428245414
+    },
+    "note": "k=8 learned: content only",
+    "group": "pooling",
+    "seq_len": 1024,
+    "repo": "FAIRC/token-averaging-avg_50m_k8_learnable",
+    "ppl": 122.78998899476126,
+    "ckpt_meta": {
+      "step": 497071.0,
+      "tokens_seen": 8144011264.0,
+      "cumulative_flops": 1.5371306559288115e+17
+    }
+  },
+  "avg_50m_k8_wexp": {
+    "k": 8,
+    "n_seqs": 3339,
+    "mean_nll": 4.12164296697822,
+    "n_predictions": 3369051,
+    "per_offset": {
+      "0": 4.124727349968219,
+      "1": 4.113081221167789,
+      "2": 4.127723971467134,
+      "3": 4.114676762998157,
+      "4": 4.125870651668972,
+      "5": 4.122745984898031,
+      "6": 4.124144696375323,
+      "7": 4.120148618052055
+    },
+    "note": "k=8 fixed recency",
+    "group": "pooling",
+    "seq_len": 1024,
+    "repo": "FAIRC/token-averaging-avg_50m_k8_wexp",
+    "ppl": 61.66046519687133,
+    "ckpt_meta": {
+      "step": 497071.0,
+      "tokens_seen": 8144011264.0,
+      "cumulative_flops": 1.5371306559288115e+17
+    }
+  },
+  "model1_50m_tied_2nctx": {
+    "k": 1,
+    "n_seqs": 1669,
+    "mean_nll": 6.743476760950126,
+    "n_predictions": 3416443,
+    "restricted": {
+      "pos_ge_2": {
+        "mean_nll": 6.727875066670535,
+        "n_predictions": 3414774
+      },
+      "pos_ge_4": {
+        "mean_nll": 6.719193501144665,
+        "n_predictions": 3411436
+      },
+      "pos_ge_8": {
+        "mean_nll": 6.713451086507217,
+        "n_predictions": 3404760
+      }
+    },
+    "note": "50M k=1 full attention @2048",
+    "group": "context",
+    "seq_len": 2048,
+    "repo": "FAIRC/token-averaging-model1_50m_tied_2ctx",
+    "ppl": 848.5056648389647,
+    "ckpt_meta": {
+      "step": 7630.0,
+      "tokens_seen": 1000079360.0,
+      "cumulative_flops": 2.995284086882304e+17
+    }
+  }
+}
