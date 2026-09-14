@@ -61,7 +61,6 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from experiments.chinchilla.model_configs import get_config, ModelConfig
-from experiments.chinchilla.eval_full_positions import eval_batches
 from experiments.shared.averaged_lm import build_method_config
 from experiments.shared.olm_model import (
     OLMTransformerBody,
@@ -69,6 +68,36 @@ from experiments.shared.olm_model import (
 )
 
 HF_PREFIX = "FAIRC/token-averaging-"
+
+EVAL_DTYPE = np.uint16   # same as fineweb_loader.DTYPE
+
+
+# ---------------------------------------------------------------------------
+# Eval data  (eval.bin only — no transformers fallback)
+# ---------------------------------------------------------------------------
+
+def eval_batches(data_dir: Path | None, seq_len: int, batch_size: int,
+                 max_batches: int | None):
+    """Yield eval batches from eval.bin."""
+    if data_dir is None or not (Path(data_dir) / "eval.bin").exists():
+        raise FileNotFoundError(
+            "eval.bin not found. Pass --data_dir pointing at the directory "
+            "that holds eval.bin (the same eval split the runs trained against)."
+        )
+    data = np.memmap(Path(data_dir) / "eval.bin", dtype=EVAL_DTYPE, mode="r")
+    n_seqs = (len(data) - 1) // seq_len
+    print(f"[eval] eval.bin: {len(data)/1e6:.1f}M tokens -> {n_seqs} seqs "
+          f"of {seq_len}", flush=True)
+    count = 0
+    for start in range(0, n_seqs, batch_size):
+        idx = range(start, min(start + batch_size, n_seqs))
+        chunk = np.stack([
+            data[i * seq_len:(i + 1) * seq_len].astype(np.int64) for i in idx
+        ])
+        yield torch.from_numpy(chunk)
+        count += 1
+        if max_batches is not None and count >= max_batches:
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +421,7 @@ def main() -> None:
             model, meta = build_and_load(cfg, ckpt, vocab_size, args.device)
             batches = eval_batches(
                 Path(args.data_dir) if args.data_dir else None,
-                "EleutherAI/pythia-70m", seq_len, args.batch_size, args.max_batches,
+                seq_len, args.batch_size, args.max_batches,
             )
             if cfg.averaging_k > 1:
                 res = score_averaged(model, cfg.averaging_k, batches, args.device)
