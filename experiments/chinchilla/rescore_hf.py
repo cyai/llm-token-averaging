@@ -307,6 +307,32 @@ def score_averaged(model, k: int, batches, device: str) -> dict:
 
 
 @torch.no_grad()
+def _chunked_nll(logits: torch.Tensor, labels: torch.Tensor,
+                 chunk_rows: int = 1024) -> torch.Tensor:
+    """
+    Per-token NLL without materialising an fp32 copy of the whole logits
+    tensor.
+
+    A full cast costs B*T*V*4 bytes, which is 3.3 GB at batch 16, 1024
+    positions and a 50k vocab, in one allocation. We upcast row blocks
+    instead, so peak extra memory is chunk_rows*V*4 (about 200 MB at the
+    default), while the arithmetic stays in fp32 as it must for a reported
+    loss.
+    """
+    B, T, V = logits.shape
+    flat_logits = logits.reshape(-1, V)
+    flat_labels = labels.reshape(-1)
+    out = torch.empty(flat_labels.shape, dtype=torch.float32,
+                      device=logits.device)
+    for i in range(0, flat_labels.numel(), chunk_rows):
+        sl = slice(i, min(i + chunk_rows, flat_labels.numel()))
+        out[sl] = F.cross_entropy(
+            flat_logits[sl].float(), flat_labels[sl], reduction="none",
+        )
+    return out.view(B, T)
+
+
+@torch.no_grad()
 def score_baseline(model, batches, device: str, seq_len: int) -> dict:
     """
     k = 1 score, kept per-position so it can be restricted afterwards to the
@@ -321,12 +347,8 @@ def score_baseline(model, batches, device: str, seq_len: int) -> dict:
         n_seqs += ids.size(0)
         with _autocast(device):
             logits = model(ids)[:, :-1]
-            labels = ids[:, 1:]
-            nll = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)).float(),
-                labels.reshape(-1),
-                reduction="none",
-            ).view(ids.size(0), -1)
+        nll = _chunked_nll(logits, ids[:, 1:])
+        del logits
         pos_nll[1:ids.size(1)] += nll.sum(dim=0).double().cpu()
         pos_cnt[1:ids.size(1)] += ids.size(0)
 
@@ -410,6 +432,19 @@ def main() -> None:
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+
+    # Report free memory up front. Scoring uses a single device, so a card
+    # that someone else's job is sitting on will OOM well into a multi-GB
+    # download rather than at startup. Select a different one with
+    # CUDA_VISIBLE_DEVICES=<n>.
+    if args.device.startswith("cuda"):
+        free, total = torch.cuda.mem_get_info(torch.device(args.device))
+        print(f"[gpu] {args.device} ({torch.cuda.get_device_name(args.device)}): "
+              f"{free/1e9:.1f} GB free of {total/1e9:.1f} GB", flush=True)
+        if free < 12e9:
+            print("[warn] under 12 GB free on this device. Another process is "
+                  "probably using it; re-run with CUDA_VISIBLE_DEVICES set to "
+                  "an idle GPU.", flush=True)
 
     vocab_size = _VOCAB_SIZE
 
