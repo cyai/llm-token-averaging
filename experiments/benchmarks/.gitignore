@@ -1,0 +1,5 @@
+# Downloaded model checkpoints
+.cache/
+
+# Evaluation results (regenerated)
+results/

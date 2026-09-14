@@ -51,7 +51,10 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer
+
+# Vocab size for EleutherAI/pythia-70m (GPT-NeoX BPE). Hardcoded so we don't
+# need `transformers` (which can break on torch version mismatches).
+_VOCAB_SIZE = 50_257
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_ROOT) not in sys.path:
@@ -308,7 +311,6 @@ def main() -> None:
     p.add_argument("--keep_downloads", action="store_true",
                    help="Do not delete each checkpoint after scoring. The "
                         "500M files are 5.8 GB each.")
-    p.add_argument("--tokenizer_name", type=str, default="EleutherAI/pythia-70m")
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--out", type=str, default=None, help="Write results as JSON.")
@@ -352,13 +354,10 @@ def main() -> None:
               "published ones. Pass --data_dir pointing at the training cache.",
               flush=True)
 
-    tok = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=True)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-    vocab_size = len(tok)
-
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+
+    vocab_size = _VOCAB_SIZE
 
     dl_root = Path(args.download_dir)
     dl_root.mkdir(parents=True, exist_ok=True)
@@ -393,7 +392,7 @@ def main() -> None:
             model, meta = build_and_load(cfg, ckpt, vocab_size, args.device)
             batches = eval_batches(
                 Path(args.data_dir) if args.data_dir else None,
-                args.tokenizer_name, seq_len, args.batch_size, args.max_batches,
+                "EleutherAI/pythia-70m", seq_len, args.batch_size, args.max_batches,
             )
             if cfg.averaging_k > 1:
                 res = score_averaged(model, cfg.averaging_k, batches, args.device)
