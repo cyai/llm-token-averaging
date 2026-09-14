@@ -1,0 +1,17 @@
+{
+  "run_name": "avg_50m_k2_seed1",
+  "results_tag": "seed_replicates",
+  "hf_repo_id": "FAIRC/token-averaging-seed_replicates-avg_50m_k2_seed1",
+  "checkpoint_format": {
+    "keys": [
+      "step",
+      "tokens_seen",
+      "cumulative_flops",
+      "model",
+      "optimizer",
+      "scheduler"
+    ],
+    "note": "Raw torch.save dict from experiments/chinchilla/train.py. Load with torch.load(..., map_location='cpu', weights_only=False) and take state['model']. Not a transformers AutoModel checkpoint."
+  },
+  "model_config": null
+}
