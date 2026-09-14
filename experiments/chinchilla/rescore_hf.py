@@ -392,7 +392,16 @@ def main() -> None:
     p.add_argument("--out", type=str, default=None, help="Write results as JSON.")
     p.add_argument("--dry_run", action="store_true",
                    help="List what would be scored and its download size.")
+    p.add_argument("--download_only", action="store_true",
+                   help="Fetch every checkpoint into --download_dir and exit "
+                        "without scoring. Implies --keep_downloads, so a "
+                        "later scoring pass reuses the cache.")
+    p.add_argument("--workers", type=int, default=4,
+                   help="Concurrent downloads for --download_only.")
     args = p.parse_args()
+
+    if args.download_only:
+        args.keep_downloads = True
 
     if args.only:
         todo = [m for m in MANIFEST if m[0] in set(args.only)]
@@ -424,6 +433,45 @@ def main() -> None:
         print(f"\n{len(todo)} checkpoints, {total/1e9:.1f} GB to download.")
         return
 
+    dl_root = Path(args.download_dir)
+    dl_root.mkdir(parents=True, exist_ok=True)
+
+    def _fetch(repo: str) -> tuple[str, Path | None, str | None]:
+        """Download one final.pt. Returns (repo, path, error)."""
+        try:
+            path = Path(hf_hub_download(
+                repo_id=HF_PREFIX + repo, filename="checkpoints/final.pt",
+                local_dir=str(dl_root / repo), repo_type="model",
+            ))
+            return repo, path, None
+        except Exception as exc:
+            return repo, None, f"{type(exc).__name__}: {exc}"
+
+    if args.download_only:
+        from concurrent.futures import ThreadPoolExecutor
+
+        repos = [m[1] for m in todo]
+        print(f"Downloading {len(repos)} checkpoints into {dl_root} "
+              f"with {args.workers} workers.", flush=True)
+        failures: list[tuple[str, str]] = []
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            for n, (repo, path, err) in enumerate(pool.map(_fetch, repos), 1):
+                if err:
+                    print(f"  [{n}/{len(repos)}] FAILED {repo}: {err}", flush=True)
+                    failures.append((repo, err))
+                else:
+                    size = path.stat().st_size
+                    flag = "  <<< BROKEN LFS POINTER" if size < 10_000 else ""
+                    print(f"  [{n}/{len(repos)}] {repo}  "
+                          f"{size/1e9:.2f} GB{flag}", flush=True)
+        if failures:
+            print(f"\n{len(failures)} download(s) failed:")
+            for repo, err in failures:
+                print(f"  {repo}: {err}")
+        print(f"\nDone. Score them with the same --download_dir "
+              f"and --keep_downloads.")
+        return
+
     if not args.data_dir or not (Path(args.data_dir) / "eval.bin").exists():
         print("[warn] no eval.bin: the eval split will be re-derived by "
               "streaming, so these numbers are not strictly comparable to the "
@@ -448,9 +496,6 @@ def main() -> None:
 
     vocab_size = _VOCAB_SIZE
 
-    dl_root = Path(args.download_dir)
-    dl_root.mkdir(parents=True, exist_ok=True)
-
     report: dict = {}
     for i, (name, repo, seq_len, group, note) in enumerate(todo, 1):
         rid = HF_PREFIX + repo
@@ -458,15 +503,10 @@ def main() -> None:
               flush=True)
 
         local = dl_root / repo
-        try:
-            ckpt = Path(hf_hub_download(
-                repo_id=rid, filename="checkpoints/final.pt",
-                local_dir=str(local), repo_type="model",
-            ))
-        except Exception as exc:
-            print(f"  [skip] download failed: {type(exc).__name__}: {exc}",
-                  flush=True)
-            report[name] = {"error": f"download failed: {exc}"}
+        _, ckpt, err = _fetch(repo)
+        if err:
+            print(f"  [skip] download failed: {err}", flush=True)
+            report[name] = {"error": f"download failed: {err}"}
             continue
 
         if ckpt.stat().st_size < 10_000:
