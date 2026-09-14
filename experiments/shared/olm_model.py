@@ -41,6 +41,55 @@ from experiments.shared.averaged_lm import MethodConfig, _uniform_labels
 
 
 # ---------------------------------------------------------------------------
+# torch / transformers version bridge
+#
+# `olm` imports `transformers` at import time, and transformers >= 4.53 does
+#     from torch._dynamo._trace_wrapped_higher_order_op import \
+#         TransformGetItemToIndex
+# in masking_utils.py.  That symbol only exists in torch >= 2.6, so a newer
+# transformers sitting next to an older torch makes every import of `olm`
+# fail with an ImportError, and nothing in this repo can be loaded.
+#
+# The symbol is a TorchFunctionMode used only while tracing flex-attention
+# score_mod functions, which neither transformers-as-we-use-it nor olm ever
+# reaches from our code paths.  Rather than stub it, we install a faithful
+# copy of the upstream implementation so it behaves correctly if anything
+# does use it.  When torch already provides it, this is a no-op.
+# ---------------------------------------------------------------------------
+
+def _install_transform_get_item_to_index() -> None:
+    try:
+        import torch._dynamo._trace_wrapped_higher_order_op as _twh
+    except Exception:
+        return
+    if hasattr(_twh, "TransformGetItemToIndex"):
+        return
+    try:
+        from torch.overrides import TorchFunctionMode
+        from torch.utils._pytree import tree_leaves
+    except Exception:
+        return
+
+    class TransformGetItemToIndex(TorchFunctionMode):
+        """Rewrite t[idx] into aten.index(t, idx) for all-tensor indices.
+
+        Backport of torch's implementation for older torch versions.
+        """
+
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            if func == torch.Tensor.__getitem__:
+                index_args = tree_leaves(args[1])
+                if all(isinstance(x, torch.Tensor) for x in index_args):
+                    return torch.ops.aten.index(args[0], index_args)
+            return func(*args, **(kwargs or {}))
+
+    _twh.TransformGetItemToIndex = TransformGetItemToIndex
+
+
+_install_transform_get_item_to_index()
+
+
+# ---------------------------------------------------------------------------
 # Patch OLM's naive attention → PyTorch SDPA (FlashAttention-2 on Ampere+)
 #
 # OLM's MultiHeadAttentionwithRoPE manually materialises [B,H,T,T] attention
