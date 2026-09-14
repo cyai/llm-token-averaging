@@ -52,9 +52,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# Vocab size for EleutherAI/pythia-70m (GPT-NeoX BPE). Hardcoded so we don't
-# need `transformers` (which can break on torch version mismatches).
-_VOCAB_SIZE = 50_257
+# Fallback vocab size: len(AutoTokenizer.from_pretrained("EleutherAI/pythia-70m")),
+# which is what the runs built their embeddings with. Hardcoded so we don't need
+# `transformers` (it breaks on torch version mismatches). Only used if the
+# checkpoint's embedding shape cannot be read.
+_VOCAB_SIZE = 50_277
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_ROOT) not in sys.path:
@@ -187,11 +189,34 @@ def _checkpoint_is_tied(sd: dict) -> bool:
     return torch.equal(win, wout)
 
 
+def _checkpoint_vocab_size(sd: dict) -> int | None:
+    """
+    Read the vocab size off the checkpoint's embedding matrix.
+
+    Inferring it beats hardcoding: the runs used len(tokenizer) for the
+    GPT-NeoX BPE, which is 50,277 (50,254 base merges plus special tokens),
+    not the 50,257 of GPT-2. Reading the file means any run loads correctly
+    regardless of which tokenizer revision it was trained against.
+    """
+    bb = _strip_prefix(sd, "backbone.") or sd
+    for key in ("embed_in.embedding.weight", "embed_out.blocks.1.weight"):
+        w = bb.get(key)
+        if w is not None:
+            return int(w.shape[0])
+    return None
+
+
 def build_and_load(cfg: ModelConfig, ckpt_path: Path, vocab_size: int,
                    device: str) -> tuple[torch.nn.Module, dict]:
     """Rebuild the trained model (backbone + pooling) and load its weights."""
     state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = state["model"] if isinstance(state, dict) and "model" in state else state
+
+    ckpt_vocab = _checkpoint_vocab_size(sd)
+    if ckpt_vocab is not None and ckpt_vocab != vocab_size:
+        print(f"  vocab_size {ckpt_vocab} (from checkpoint, default was "
+              f"{vocab_size})", flush=True)
+        vocab_size = ckpt_vocab
 
     tied = _checkpoint_is_tied(sd)
     if tied != bool(cfg.tie_embeddings):
