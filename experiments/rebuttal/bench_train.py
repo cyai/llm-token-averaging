@@ -54,8 +54,9 @@ def main() -> None:
     p.add_argument("--seq_len", type=int, default=None, help="Default: config context_len.")
     p.add_argument("--seq_mult", type=int, default=1, help="Raw length multiplier (TST stage 1).")
     p.add_argument("--two_stage_k", type=int, default=1)
-    p.add_argument("--steps", type=int, default=50)
-    p.add_argument("--warmup", type=int, default=15)
+    p.add_argument("--steps", type=int, default=60)
+    p.add_argument("--warmup", type=int, default=50,
+                   help="Must cover every random offset so torch.compile has seen all shapes.")
     p.add_argument("--no_compile", action="store_true")
     p.add_argument("--device", default=default_device())
     p.add_argument("--out", default=None)
