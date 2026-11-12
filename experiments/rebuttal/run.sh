@@ -25,7 +25,7 @@ done
 export HF_HUB_ENABLE_HF_TRANSFER=${HF_HUB_ENABLE_HF_TRANSFER:-0}
 
 $PYTHON experiments/rebuttal/jobs.py --sets "${SETS[@]}" --gpus "$GPUS" \
-  --data_dir "$DATA_DIR" --out "$OUT" $LIST
+  --data_dir "$DATA_DIR" --out "$OUT" --max_foreign_mb "${MAX_FOREIGN_MB:-12000}" $LIST
 [[ -n "$LIST" ]] && exit 0
 
 $PYTHON experiments/rebuttal/aggregate.py --out "$OUT/analysis" \

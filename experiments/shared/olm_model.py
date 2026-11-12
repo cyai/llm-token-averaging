@@ -477,14 +477,14 @@ class OLMTwoStageLanguageModel(nn.Module):
         logits = self.backbone.embed_out(self.backbone.body(hidden_avg[:, :-1]))
 
         if self.training:
+            logp = F.log_softmax(logits.float(), dim=-1)
             total_loss = 0.0
             for i in range(k):
                 labels_i = input_ids[:, k + i :: k]
                 lbl_len = min(logits.size(1), labels_i.size(1))
-                total_loss += F.cross_entropy(
-                    logits[:, :lbl_len].reshape(-1, logits.size(-1)),
-                    labels_i[:, :lbl_len].reshape(-1),
-                )
+                total_loss = total_loss - logp[:, :lbl_len].gather(
+                    -1, labels_i[:, :lbl_len, None]
+                ).mean()
             return total_loss / k, logits
 
         lbl_len = min(logits.size(1), labels_single.size(1))

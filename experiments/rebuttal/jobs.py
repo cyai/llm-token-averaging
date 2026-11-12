@@ -299,12 +299,28 @@ def order_jobs(jobs: list[Job], sets: list[str]) -> list[Job]:
     return sorted((j for j in jobs if j.set in sets), key=lambda j: rank[j.set])
 
 
-def run_queue(jobs: list[Job], gpus: list[str], log_dir: Path, poll: float = 15.0) -> None:
+def gpu_mem_used_mb() -> dict[str, int]:
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used",
+                              "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    used = {}
+    for line in out.strip().splitlines():
+        idx, mem = (s.strip() for s in line.split(","))
+        used[idx] = int(mem)
+    return used
+
+
+def run_queue(jobs: list[Job], gpus: list[str], log_dir: Path, poll: float = 15.0,
+              max_foreign_mb: int | None = None) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     pending = [j for j in jobs if not j.done.exists()]
     running: dict[str, tuple[subprocess.Popen, Job, object]] = {}
     free = list(gpus)
     failed: list[str] = []
+    last_shared: list[str] = []
 
     def stop(*_):
         for proc, job, fh in running.values():
@@ -340,6 +356,15 @@ def run_queue(jobs: list[Job], gpus: list[str], log_dir: Path, poll: float = 15.
         started = True
         while started:
             started = False
+            if max_foreign_mb is None:
+                usable = list(free)
+            else:
+                used = gpu_mem_used_mb()
+                usable = [g for g in free if used.get(g, 0) <= max_foreign_mb]
+                shared = sorted(set(free) - set(usable))
+                if shared != last_shared:
+                    print(f"[queue] skipping GPUs in use by other processes: {shared}", flush=True)
+                    last_shared = shared
             for job in list(pending):
                 if job.done.exists():
                     pending.remove(job)
@@ -351,8 +376,9 @@ def run_queue(jobs: list[Job], gpus: list[str], log_dir: Path, poll: float = 15.
                 if job.cpu:
                     slot = f"cpu-{job.name}"
                     env_gpu = ""
-                elif free:
-                    slot = free.pop(0)
+                elif usable:
+                    slot = usable.pop(0)
+                    free.remove(slot)
                     env_gpu = slot
                 else:
                     continue
@@ -368,7 +394,7 @@ def run_queue(jobs: list[Job], gpus: list[str], log_dir: Path, poll: float = 15.
                       flush=True)
                 started = True
 
-        if not running and pending:
+        if not running and pending and not any(all(n.exists() for n in j.needs) for j in pending):
             blocked = [j.name for j in pending]
             print(f"[queue] {len(blocked)} job(s) blocked on missing inputs "
                   f"(their training failed or was not selected):", flush=True)
@@ -399,6 +425,9 @@ def main() -> None:
     p.add_argument("--list", action="store_true")
     p.add_argument("--no_eval_deps", action="store_true",
                    help="Drop the per-run rescore/downstream jobs.")
+    p.add_argument("--max_foreign_mb", type=int, default=None,
+                   help="Do not start a job on a GPU that other processes already use "
+                        "more than this many MiB of.")
     args = p.parse_args()
 
     sets = SET_ORDER if "all" in args.sets else args.sets
@@ -421,7 +450,7 @@ def main() -> None:
         print(f"\n{len(jobs)} job(s); {sum(not j.done.exists() for j in jobs)} not done")
         return
     run_queue(jobs, [g.strip() for g in args.gpus.split(",") if g.strip()],
-              Path(args.out) / "logs")
+              Path(args.out) / "logs", max_foreign_mb=args.max_foreign_mb)
 
 
 if __name__ == "__main__":
