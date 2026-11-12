@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import dataclasses
 import json
 import os
 import random
@@ -68,6 +69,7 @@ from experiments.shared.olm_model import (
     OLMTransformerBody,
     OLMAveragedLanguageModel,
     OLMPhasedAveragedLanguageModel,
+    OLMTwoStageLanguageModel,
 )
 from experiments.shared.averaged_lm import build_method_config
 
@@ -77,6 +79,19 @@ from experiments.shared.averaged_lm import build_method_config
 # ---------------------------------------------------------------------------
 
 MIN_LR_RATIO = 0.1  # η_min = 0.1 × η_max (Chinchilla 10× decay, LLaMA convention)
+EQ2_VOCAB = 50_304
+
+
+def train_flops_per_seq(cfg: ModelConfig, positions: int) -> tuple[float, float]:
+    """Training FLOPs for one sequence that occupies `positions` transformer positions.
+
+    Returns (body_only, eq2). body_only is the historical cumulative_flops metric
+    (no LM head); eq2 adds the 2dV head term, as in Eq. 2 of the paper.
+    """
+    d = cfg.d_model
+    body = 3 * positions * cfg.n_layers * (23 * d * d + 4 * positions * d)
+    head = 3 * positions * 2 * d * EQ2_VOCAB
+    return float(body), float(body + head)
 
 
 # ---------------------------------------------------------------------------
@@ -499,10 +514,18 @@ def train_model(
         data_dir=args.data_dir,
         target_tokens=cfg.target_tokens,
         seed=seed,
+        max_unique_tokens=args.max_unique_tokens,
     )
+
+    two_stage_k = args.two_stage_k
+    is_two_stage = two_stage_k > 1
+    if is_two_stage and cfg.averaging_k != 1:
+        raise ValueError("--two_stage_k needs a k=1 base config (e.g. model1_50m)")
+    seq_mult = args.two_stage_seq_mult if is_two_stage else 1
 
     # --- model --------------------------------------------------------------
     is_averaged = cfg.averaging_k > 1
+    uses_loss_forward = is_averaged or is_two_stage
 
     if is_main:
         print(
@@ -526,7 +549,11 @@ def train_model(
 
     is_phased = cfg.multi_token_phase_ratio > 0
 
-    if is_averaged:
+    if is_two_stage:
+        model = OLMTwoStageLanguageModel(
+            backbone, build_method_config(f"uniform_k{two_stage_k}"), k=two_stage_k,
+        )
+    elif is_averaged:
         _method_name = cfg.method_name or f"uniform_k{cfg.averaging_k}"
         method_cfg = build_method_config(_method_name)
         if is_phased:
@@ -572,7 +599,7 @@ def train_model(
     model.to(device)
 
     # torch.compile for fused kernels — requires OLM with compile support
-    if hasattr(torch, "compile"):
+    if hasattr(torch, "compile") and not args.no_compile:
         # Disable DDP optimizer in dynamo — gradient checkpointing uses
         # higher-order ops that the DDP optimizer can't split across buckets.
         torch._dynamo.config.optimize_ddp = False
@@ -624,10 +651,55 @@ def train_model(
     # Cosine decay to 10% of peak LR (Chinchilla/LLaMA convention).
     # Cycle length = total training steps (Chinchilla Fig A1: overshooting hurts).
     accum_steps = args.accum_steps
-    total_steps = estimate_total_batches(
-        cfg.target_tokens, args.seq_len, args.batch_size, world_size,
-        accum_steps=accum_steps,
-    )
+    if args.total_steps is not None:
+        total_steps = args.total_steps
+    else:
+        total_steps = estimate_total_batches(
+            cfg.target_tokens, args.seq_len, args.batch_size, world_size,
+            accum_steps=accum_steps,
+        )
+
+    # --- per-step cost of each stage (FLOPs = 3 × forward) -------------------
+    seqs_per_micro_step  = args.batch_size * world_size
+    seqs_per_global_step = seqs_per_micro_step * accum_steps
+
+    def _stage_costs(raw_len: int, positions: int) -> tuple[int, float, float]:
+        body, eq2 = train_flops_per_seq(cfg, positions)
+        return (seqs_per_global_step * raw_len,
+                seqs_per_global_step * body,
+                seqs_per_global_step * eq2)
+
+    if is_two_stage:
+        stage1_raw_len = args.seq_len * seq_mult
+        stage1_costs = _stage_costs(stage1_raw_len, stage1_raw_len // two_stage_k)
+        stage2_costs = _stage_costs(args.seq_len, args.seq_len)
+        stage_switch_step = int(total_steps * args.two_stage_frac)
+    else:
+        stage1_costs = stage2_costs = _stage_costs(
+            args.seq_len, args.seq_len // cfg.averaging_k)
+        stage_switch_step = total_steps
+    planned_tokens = (stage_switch_step * stage1_costs[0]
+                      + (total_steps - stage_switch_step) * stage2_costs[0])
+    planned_flops_eq2 = (stage_switch_step * stage1_costs[2]
+                         + (total_steps - stage_switch_step) * stage2_costs[2])
+
+    stage1_dl = None
+    if is_two_stage and seq_mult > 1:
+        stage1_dl, _ = build_dataloaders(
+            tokenizer=tokenizer,
+            seq_len=args.seq_len * seq_mult,
+            batch_size=args.batch_size,
+            eval_batches=1,
+            num_workers=args.num_workers,
+            rank=global_rank,
+            world_size=world_size,
+            distributed=(world_size > 1),
+            data_dir=args.data_dir,
+            target_tokens=stage_switch_step * stage1_costs[0],
+            seed=seed,
+            max_unique_tokens=args.max_unique_tokens,
+        )
+
     optimizer = _build_optimizer(model, lr=cfg.lr)
     scheduler = get_cosine_schedule_with_warmup_and_min_lr(
         optimizer,
@@ -640,6 +712,7 @@ def train_model(
     start_step       = 0
     tokens_seen      = 0
     cumulative_flops = 0.0
+    flops_eq2        = 0.0
 
     if args.resume:
         state, latest = load_latest_checkpoint(ckpt_dir, device)
@@ -652,6 +725,8 @@ def train_model(
             start_step       = state["step"]
             tokens_seen      = state["tokens_seen"]
             cumulative_flops = state["cumulative_flops"]
+            flops_eq2        = state.get(
+                "flops_eq2", cumulative_flops * stage1_costs[2] / stage1_costs[1])
             if is_main:
                 print(
                     f"[{cfg.name}] Resumed: step={start_step:,} "
@@ -682,6 +757,8 @@ def train_model(
             "averaging_k": cfg.averaging_k,
             "transformer_positions_per_seq": args.seq_len // cfg.averaging_k,
             "target_tokens": cfg.target_tokens,
+            "planned_tokens": planned_tokens,
+            "planned_flops_eq2": planned_flops_eq2,
             "total_steps_planned": total_steps,
             "warmup_steps": cfg.warmup_steps,
             "peak_lr": cfg.lr,
@@ -689,6 +766,13 @@ def train_model(
             "grad_checkpoint": cfg.grad_checkpoint,
             "tie_embeddings": cfg.tie_embeddings,
             "method_name": cfg.method_name,
+            "base_config": args.model,
+            "max_unique_tokens": args.max_unique_tokens,
+            "two_stage_k": two_stage_k if is_two_stage else None,
+            "two_stage_frac": args.two_stage_frac if is_two_stage else None,
+            "two_stage_seq_mult": seq_mult if is_two_stage else None,
+            "stage_switch_step": stage_switch_step if is_two_stage else None,
+            "compiled": not args.no_compile,
             "torch_version": torch.__version__,
             "resumed": bool(args.resume),
         }
@@ -704,34 +788,63 @@ def train_model(
     # --- CSV log (rank 0 only) ----------------------------------------------
     csv_file   = None
     csv_writer = None
+    write_eq2  = True
     if is_main:
         csv_mode = "a" if (args.resume and log_path.exists()) else "w"
+        if csv_mode == "a":
+            with open(log_path) as f:
+                write_eq2 = "flops_eq2" in f.readline().strip().split(",")
         csv_file = open(log_path, csv_mode, newline="")
         csv_writer = csv.writer(csv_file)
         if csv_mode == "w":
             csv_writer.writerow(
                 ["step", "tokens_seen", "cumulative_flops", "train_loss",
-                 "eval_loss", "eval_loss_all_pos"]
+                 "eval_loss", "eval_loss_all_pos", "flops_eq2"]
             )
             csv_file.flush()
 
-    # --- FLOPs per global optimizer step ------------------------------------
-    # Training FLOPs = 3 × forward FLOPs (forward + backward).
-    # Forward FLOPs per token per layer:
-    #   Attention projections (Q,K,V,Out): 4 × 2d² = 8d²
-    #   Attention matmuls (Q@K^T, Attn@V): 2×2×L×d = 4Ld
-    #   SwiGLU FFN (up: d→2h, down: h→d, h=2.5d): 2d×2h + 2h×d = 2d×5d + 2×2.5d×d = 15d²
-    #   Total forward per token per layer: 8d² + 4Ld + 15d² = 23d² + 4Ld
-    # Training (fwd+bwd) per token per layer: 3 × (23d² + 4Ld) = 69d² + 12Ld
-    transformer_L          = args.seq_len // cfg.averaging_k
-    d                      = cfg.d_model
-    fwd_flops_per_token_per_layer = 23 * d * d + 4 * transformer_L * d
-    train_flops_per_token_per_layer = 3 * fwd_flops_per_token_per_layer
-    flops_per_seq          = cfg.n_layers * transformer_L * train_flops_per_token_per_layer
-    seqs_per_micro_step    = args.batch_size * world_size
-    seqs_per_global_step   = seqs_per_micro_step * accum_steps
-    tokens_per_global_step = seqs_per_global_step * args.seq_len
-    flops_per_global_step  = seqs_per_global_step * flops_per_seq
+    def _write_row(train_l: float, ev: float, ev_all: float) -> None:
+        row = [step, tokens_seen, f"{cumulative_flops:.6e}",
+               f"{train_l:.6f}", f"{ev:.6f}", f"{ev_all:.6f}"]
+        if write_eq2:
+            row.append(f"{flops_eq2:.6e}")
+        csv_writer.writerow(row)
+        csv_file.flush()
+
+    def _ckpt_state() -> dict:
+        return {
+            "step":             step,
+            "tokens_seen":      tokens_seen,
+            "cumulative_flops": cumulative_flops,
+            "flops_eq2":        flops_eq2,
+            "model":            model.state_dict(),
+            "optimizer":        optimizer.state_dict(),
+            "scheduler":        scheduler.state_dict(),
+        }
+
+    tokens_per_global_step, flops_per_global_step, eq2_per_global_step = stage1_costs
+
+    # --- two-stage training (PLT / TST): stage 1 → token-level -------------
+    stage_switched = False
+    if is_two_stage:
+        if is_main:
+            print(
+                f"[{cfg.name}] Two-stage: k={two_stage_k}, raw seq "
+                f"{args.seq_len * seq_mult} in stage 1, switch to token level at "
+                f"step {stage_switch_step:,}/{total_steps:,}; planned "
+                f"{planned_tokens/1e9:.3f}B tokens, {planned_flops_eq2:.3e} FLOPs (Eq. 2)",
+                flush=True,
+            )
+        if start_step >= stage_switch_step:
+            raw_model = ddp_model.module if world_size > 1 else ddp_model
+            raw_model.set_token_level(True)
+            stage_switched = True
+            tokens_per_global_step, flops_per_global_step, eq2_per_global_step = stage2_costs
+
+    def _eval_k() -> int:
+        if is_two_stage:
+            return 1 if stage_switched else two_stage_k
+        return cfg.averaging_k
 
     # --- phased training: compute switch step --------------------------------
     phase_switch_step = 0
@@ -757,20 +870,23 @@ def train_model(
     EMA_A      = 0.98
     early_stop = False   # set to True on all ranks when target eval loss is hit
 
-    train_iter = iter(train_dl)
+    active_dl = stage1_dl if (stage1_dl is not None and not stage_switched) else train_dl
+    train_iter = iter(active_dl)
 
     if is_main:
         accum_info = f" (accum {accum_steps}×{seqs_per_micro_step} seqs)" if accum_steps > 1 else ""
         print(
             f"[{cfg.name}] Starting: {total_steps:,} steps × "
             f"{tokens_per_global_step:,} tokens/step{accum_info} "
-            f"= {cfg.target_tokens/1e9:.1f}B tokens",
+            f"= {planned_tokens/1e9:.3f}B tokens",
             flush=True,
         )
 
     # Reset peak memory stats for accurate tracking from training start
-    torch.cuda.reset_peak_memory_stats(device)
+    if device_type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     t0 = time.time()
+    tokens_at_start = tokens_seen
 
     use_no_sync = world_size > 1 and accum_steps > 1
     no_sync_ctx = ddp_model.no_sync if use_no_sync else None
@@ -783,7 +899,7 @@ def train_model(
             try:
                 batch = next(train_iter)
             except StopIteration:
-                train_iter = iter(train_dl)
+                train_iter = iter(active_dl)
                 batch = next(train_iter)
 
             if isinstance(batch, dict):
@@ -797,7 +913,7 @@ def train_model(
             with sync_ctx:
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16,
                                     enabled=use_amp):
-                    if is_averaged:
+                    if uses_loss_forward:
                         loss, _ = ddp_model(input_ids)
                     else:
                         logits = ddp_model(input_ids)
@@ -820,6 +936,22 @@ def train_model(
         step             += 1
         tokens_seen      += tokens_per_global_step
         cumulative_flops += flops_per_global_step
+        flops_eq2        += eq2_per_global_step
+
+        if is_two_stage and not stage_switched and step >= stage_switch_step:
+            raw_model = ddp_model.module if world_size > 1 else ddp_model
+            raw_model.set_token_level(True)
+            stage_switched = True
+            tokens_per_global_step, flops_per_global_step, eq2_per_global_step = stage2_costs
+            if active_dl is not train_dl:
+                active_dl = train_dl
+                train_iter = iter(active_dl)
+            if is_main:
+                print(
+                    f"[{cfg.name}] Stage switch → token-level training at step "
+                    f"{step:,} ({tokens_seen/1e9:.3f}B tokens, {flops_eq2:.3e} FLOPs)",
+                    flush=True,
+                )
 
         # --- phase switch (superposition → recovery) -----------------------
         if is_phased and not phase_switched and step >= phase_switch_step:
@@ -855,26 +987,25 @@ def train_model(
             eval_loss_val, eval_all_val = _eval_loss(
                 model, eval_dl, device,
                 max_batches=args.eval_batches,
-                is_averaged=is_averaged,
-                avg_k=cfg.averaging_k,
+                is_averaged=uses_loss_forward,
+                avg_k=_eval_k(),
             )
-            csv_writer.writerow([
-                step, tokens_seen, f"{cumulative_flops:.6e}",
-                f"{ema_val:.6f}", f"{eval_loss_val:.6f}", f"{eval_all_val:.6f}",
-            ])
-            csv_file.flush()
+            _write_row(ema_val, eval_loss_val, eval_all_val)
 
             elapsed   = time.time() - t0
-            tok_s     = tokens_seen / elapsed
-            pct       = 100.0 * tokens_seen / cfg.target_tokens
-            eta_h     = ((cfg.target_tokens - tokens_seen) / max(tok_s, 1)) / 3600
+            tok_s     = (tokens_seen - tokens_at_start) / elapsed
+            pct       = 100.0 * step / total_steps
+            eta_h     = ((total_steps - step) * elapsed / max(step - start_step, 1)) / 3600
             lr_now    = scheduler.get_last_lr()[0]
-            mem_alloc = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-            mem_resrv = torch.cuda.max_memory_reserved(device) / (1024 ** 3)
+            if device_type == "cuda":
+                mem_alloc = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+                mem_resrv = torch.cuda.max_memory_reserved(device) / (1024 ** 3)
+            else:
+                mem_alloc = mem_resrv = 0.0
 
             print(
                 f"[{cfg.name}] step={step:>8,} | "
-                f"tokens={tokens_seen/1e9:.3f}B/{cfg.target_tokens/1e9:.0f}B ({pct:.1f}%) | "
+                f"tokens={tokens_seen/1e9:.3f}B/{planned_tokens/1e9:.2f}B ({pct:.1f}%) | "
                 f"loss={ema_val:.4f} | eval={eval_loss_val:.4f} | "
                 f"evalAll={eval_all_val:.4f} | "
                 f"lr={lr_now:.2e} | flops={cumulative_flops:.2e} | "
@@ -894,23 +1025,8 @@ def train_model(
                     flush=True,
                 )
                 early_ckpt = ckpt_dir / f"early_stop_step_{step:08d}.pt"
-                save_checkpoint_atomic(
-                    {
-                        "step":             step,
-                        "tokens_seen":      tokens_seen,
-                        "cumulative_flops": cumulative_flops,
-                        "model":            model.state_dict(),
-                        "optimizer":        optimizer.state_dict(),
-                        "scheduler":        scheduler.state_dict(),
-                    },
-                    early_ckpt,
-                )
-                csv_writer.writerow([
-                    step, tokens_seen, f"{cumulative_flops:.6e}",
-                    f"{ema_val:.6f}", f"{eval_loss_val:.6f}",
-                    f"{eval_all_val:.6f}",
-                ])
-                csv_file.flush()
+                save_checkpoint_atomic(_ckpt_state(), early_ckpt)
+                _write_row(ema_val, eval_loss_val, eval_all_val)
                 csv_file.close()
                 csv_file = None
                 early_stop = True
@@ -931,17 +1047,7 @@ def train_model(
         # --- checkpoint (rank 0; barrier syncs all ranks) -------------------
         if is_main and step % args.checkpoint_steps == 0:
             ckpt_path = ckpt_dir / f"step_{step:08d}.pt"
-            save_checkpoint_atomic(
-                {
-                    "step":             step,
-                    "tokens_seen":      tokens_seen,
-                    "cumulative_flops": cumulative_flops,
-                    "model":            model.state_dict(),
-                    "optimizer":        optimizer.state_dict(),
-                    "scheduler":        scheduler.state_dict(),
-                },
-                ckpt_path,
-            )
+            save_checkpoint_atomic(_ckpt_state(), ckpt_path)
             print(f"[{cfg.name}] Checkpoint → {ckpt_path}", flush=True)
             prune_old_checkpoints(ckpt_dir, args.keep_last_checkpoints)
 
@@ -952,27 +1058,14 @@ def train_model(
     # --- final checkpoint + eval (rank 0) -----------------------------------
     if is_main:
         final_ckpt = ckpt_dir / "final.pt"
-        save_checkpoint_atomic(
-            {
-                "step":             step,
-                "tokens_seen":      tokens_seen,
-                "cumulative_flops": cumulative_flops,
-                "model":            model.state_dict(),
-                "optimizer":        optimizer.state_dict(),
-                "scheduler":        scheduler.state_dict(),
-            },
-            final_ckpt,
-        )
+        save_checkpoint_atomic(_ckpt_state(), final_ckpt)
         final_eval, final_eval_all = _eval_loss(
             model, eval_dl, device,
             max_batches=args.eval_batches * 2,
-            is_averaged=is_averaged,
-            avg_k=cfg.averaging_k,
+            is_averaged=uses_loss_forward,
+            avg_k=_eval_k(),
         )
-        csv_writer.writerow([
-            step, tokens_seen, f"{cumulative_flops:.6e}",
-            f"{ema_val:.6f}", f"{final_eval:.6f}", f"{final_eval_all:.6f}",
-        ])
+        _write_row(ema_val, final_eval, final_eval_all)
         if csv_file is not None:
             csv_file.flush()
             csv_file.close()
@@ -1046,12 +1139,46 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--early_stop_eval_loss", type=float, default=None,
                    help="Stop training early when eval loss falls at or below "
                         "this value (e.g. 4.286754 to match avg_50m_k2_v2).")
+    p.add_argument("--run_name",         type=str, default=None,
+                   help="Directory/log name instead of the config name.")
+    p.add_argument("--lr",               type=float, default=None,
+                   help="Override the config's peak learning rate.")
+    p.add_argument("--warmup_steps",     type=int, default=None)
+    p.add_argument("--target_tokens",    type=int, default=None,
+                   help="Override the config's raw-token budget.")
+    p.add_argument("--total_steps",      type=int, default=None,
+                   help="Fix the number of optimizer steps instead of deriving "
+                        "it from the token budget.")
+    p.add_argument("--max_unique_tokens", type=int, default=None,
+                   help="Train on only this many distinct corpus tokens, "
+                        "repeated as needed (data-constrained setting).")
+    p.add_argument("--two_stage_k",      type=int, default=1,
+                   help="PLT/TST baseline: average k tokens and predict the next "
+                        "k (mean CE) for the first --two_stage_frac of steps, "
+                        "then train token-level. Needs a k=1 config.")
+    p.add_argument("--two_stage_frac",   type=float, default=2 / 3,
+                   help="Fraction of optimizer steps spent in the compressed stage.")
+    p.add_argument("--two_stage_seq_mult", type=int, default=1,
+                   help="Raw sequence length multiplier in stage 1. 1 = same raw "
+                        "length as stage 2 (patch-level training); k = k× longer "
+                        "raw sequences so stage-1 steps cost about the same "
+                        "FLOPs as token-level steps (token superposition).")
+    p.add_argument("--no_compile",       action="store_true")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     cfg  = get_config(args.model)
+    overrides = {
+        "name": args.run_name,
+        "lr": args.lr,
+        "warmup_steps": args.warmup_steps,
+        "target_tokens": args.target_tokens,
+    }
+    overrides = {k: v for k, v in overrides.items() if v is not None}
+    if overrides:
+        cfg = dataclasses.replace(cfg, **overrides)
     results_dir = Path(args.results_dir) / cfg.name if args.results_dir else None
     log_path = train_model(cfg, args, results_dir=results_dir)
     if _is_main_process():

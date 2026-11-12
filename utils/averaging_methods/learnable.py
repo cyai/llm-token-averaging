@@ -130,6 +130,16 @@ class PositionalLearnableAverager(LearnableAverager):
         return averaged, weights
 
 
+class UniformInitPositionalLearnableAverager(PositionalLearnableAverager):
+    """PositionalLearnableAverager with position logits starting at zero for every k,
+    so training starts from exact mean pooling."""
+
+    def __init__(self, hidden_dim: int, k: int):
+        super().__init__(hidden_dim=hidden_dim, k=k)
+        with torch.no_grad():
+            self.position_logits.zero_()
+
+
 class ReconstructionDecoder(nn.Module):
     """
     Decodes a single averaged embedding back to k original-token embeddings.

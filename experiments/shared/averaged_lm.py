@@ -36,6 +36,7 @@ from utils.averaging_methods import (
     compute_weights,
     LearnableAverager,
     PositionalLearnableAverager,
+    UniformInitPositionalLearnableAverager,
 )
 
 
@@ -297,9 +298,14 @@ def build_method_config(name: str, learnable_checkpoint_dir: Optional[str] = Non
         )
 
     # ---- learnable, with explicit learned within-window position bias ----
-    if name.startswith("learnable_pos_k"):
+    if name.startswith("learnable_pos_k") or name.startswith("learnable_posuni_k"):
         k = int(name.split("_k")[1])
-        averager = PositionalLearnableAverager(hidden_dim=512, k=k)
+        averager_cls = (
+            UniformInitPositionalLearnableAverager
+            if name.startswith("learnable_posuni_k")
+            else PositionalLearnableAverager
+        )
+        averager = averager_cls(hidden_dim=512, k=k)
 
         def _avg_fn(hidden, input_ids, _averager=averager, _k=k):
             avg, _ = _averager(hidden)

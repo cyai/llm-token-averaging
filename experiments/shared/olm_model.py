@@ -419,3 +419,77 @@ class OLMPhasedAveragedLanguageModel(nn.Module):
 
     def parameters_to_train(self):
         return self.parameters()
+
+
+# ---------------------------------------------------------------------------
+# OLMTwoStageLanguageModel  (Patch-Level Training / Token Superposition Training)
+# ---------------------------------------------------------------------------
+
+class OLMTwoStageLanguageModel(nn.Module):
+    """
+    Two-stage baseline: a compressed stage followed by ordinary token-level
+    training of the same backbone.
+
+    Stage 1 (token_level=False): non-overlapping groups of k token embeddings
+    are averaged, and each group predicts every token of the next group with
+    the shared LM head, loss = (1/k) * sum_i CE(logits, t_i). This is the
+    patch-level objective of Shao et al. (2025) and the MCE objective of
+    Peng et al. (2026). No random offset is used.
+
+    Stage 2 (token_level=True): the standard next-token model. After training
+    the averaging step is no longer used, so inference is the k=1 model.
+
+    In eval mode during stage 1 the loss is the first-token-of-next-group CE,
+    the same quantity OLMAveragedLanguageModel reports.
+    """
+
+    def __init__(
+        self,
+        backbone: OLMTransformerBody,
+        method_config: MethodConfig,
+        k: int,
+    ) -> None:
+        super().__init__()
+        self.backbone = backbone
+        self.cfg = method_config
+        self.k = k
+        self.token_level = False
+
+    def set_token_level(self, enabled: bool) -> None:
+        self.token_level = enabled
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.token_level:
+            logits = self.backbone(input_ids)[:, :-1]
+            labels = input_ids[:, 1:]
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), labels.reshape(-1),
+            )
+            return loss, logits
+
+        k = self.k
+        hidden = self.backbone.embed_in(input_ids)
+        hidden_avg, labels_single = self.cfg.avg_fn(hidden, input_ids)
+        logits = self.backbone.embed_out(self.backbone.body(hidden_avg[:, :-1]))
+
+        if self.training:
+            total_loss = 0.0
+            for i in range(k):
+                labels_i = input_ids[:, k + i :: k]
+                lbl_len = min(logits.size(1), labels_i.size(1))
+                total_loss += F.cross_entropy(
+                    logits[:, :lbl_len].reshape(-1, logits.size(-1)),
+                    labels_i[:, :lbl_len].reshape(-1),
+                )
+            return total_loss / k, logits
+
+        lbl_len = min(logits.size(1), labels_single.size(1))
+        loss = F.cross_entropy(
+            logits[:, :lbl_len].reshape(-1, logits.size(-1)),
+            labels_single[:, :lbl_len].reshape(-1),
+        )
+        return loss, logits[:, :lbl_len]

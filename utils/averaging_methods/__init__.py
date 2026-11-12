@@ -8,6 +8,7 @@ from .weighted import apply_weighted_averaging, compute_weights, compute_weight_
 from .learnable import (
     LearnableAverager,
     PositionalLearnableAverager,
+    UniformInitPositionalLearnableAverager,
     ReconstructionDecoder,
     train_learnable_averager,
     apply_trained_averager,
@@ -32,6 +33,7 @@ __all__ = [
     # Learnable
     "LearnableAverager",
     "PositionalLearnableAverager",
+    "UniformInitPositionalLearnableAverager",
     "ReconstructionDecoder",
     "train_learnable_averager",
     "apply_trained_averager",

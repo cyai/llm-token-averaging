@@ -92,10 +92,12 @@ class _LocalBinDataset(Dataset):
     with zero data duplication or extra memory.
     """
 
-    def __init__(self, path: Path, seq_len: int):
+    def __init__(self, path: Path, seq_len: int, max_seqs: Optional[int] = None):
         self.seq_len = seq_len
         self.data = np.memmap(path, dtype=DTYPE, mode="r")
         self.n_seqs = (len(self.data) - 1) // seq_len
+        if max_seqs is not None:
+            self.n_seqs = min(self.n_seqs, max_seqs)
 
     def __len__(self):
         return self.n_seqs
@@ -113,10 +115,11 @@ def _build_local_dataloaders(
     num_workers: int,
     distributed: bool,
     seed: int = 0,
+    max_train_seqs: Optional[int] = None,
 ):
     from torch.utils.data import DistributedSampler
 
-    train_ds = _LocalBinDataset(data_dir / "train.bin", seq_len)
+    train_ds = _LocalBinDataset(data_dir / "train.bin", seq_len, max_seqs=max_train_seqs)
     eval_ds = _LocalBinDataset(data_dir / "eval.bin", seq_len)
 
     train_sampler = (
@@ -186,6 +189,7 @@ class _TokBinStreamDataset(IterableDataset):
         rank: int = 0,
         world_size: int = 1,
         seed: int = 0,
+        max_seqs: Optional[int] = None,
     ):
         super().__init__()
         self.tok_files = tok_files
@@ -194,6 +198,7 @@ class _TokBinStreamDataset(IterableDataset):
         self.rank = rank
         self.world_size = world_size
         self.seed = seed
+        self.max_seqs = max_seqs
 
     def __iter__(self):
         wi = torch.utils.data.get_worker_info()
@@ -206,7 +211,11 @@ class _TokBinStreamDataset(IterableDataset):
 
         global_seq = 0
         while True:  # loop forever — training is controlled by step count
+            if self.max_seqs is not None and global_seq >= self.max_seqs:
+                global_seq = 0
             for file_i, tok_file in enumerate(self.tok_files):
+                if self.max_seqs is not None and global_seq >= self.max_seqs:
+                    break
                 data = np.memmap(tok_file, dtype=DTYPE, mode="r")
                 # skip_head_tokens is keyed to the first file, so the file order
                 # is never rotated; only the sequence order within a file is.
@@ -220,6 +229,8 @@ class _TokBinStreamDataset(IterableDataset):
                     else 0
                 )
                 for s in range(n_seqs):
+                    if self.max_seqs is not None and global_seq >= self.max_seqs:
+                        break
                     if global_seq % eff_ws == eff_rank:
                         s_rot = (s + rot) % n_seqs
                         offset = start + s_rot * self.seq_len
@@ -241,6 +252,7 @@ def _build_tok_bin_dataloaders(
     world_size: int,
     skip_head_tokens: int = 0,
     seed: int = 0,
+    max_train_seqs: Optional[int] = None,
 ):
     from torch.utils.data import DistributedSampler
 
@@ -251,6 +263,7 @@ def _build_tok_bin_dataloaders(
         rank=rank,
         world_size=world_size,
         seed=seed,
+        max_seqs=max_train_seqs,
     )
     train_dl = DataLoader(
         train_ds,
@@ -861,9 +874,15 @@ def build_dataloaders(
     data_dir: Optional[str | Path] = None,
     target_tokens: Optional[int] = None,
     seed: int = 0,
+    max_unique_tokens: Optional[int] = None,
 ):
     """
     Build (train_dataloader, eval_dataloader) for FineWeb.
+
+    ``max_unique_tokens`` restricts training to the first that many tokens of
+    the local corpus (rounded down to whole sequences), which are then
+    repeated for as many epochs as the step budget needs. Only supported for
+    the local train.bin and .tok.bin paths.
 
     ``seed`` controls the training data order only; the eval loader is always
     built in the same fixed order so that losses stay comparable across seeds.
@@ -884,6 +903,14 @@ def build_dataloaders(
     """
     is_main = rank == 0
     subset = _select_subset(target_tokens)
+    max_train_seqs = (
+        max_unique_tokens // seq_len if max_unique_tokens is not None else None
+    )
+    if max_unique_tokens is not None and data_dir is None:
+        raise ValueError("max_unique_tokens requires a local data_dir")
+    needed_tokens = target_tokens
+    if max_unique_tokens is not None and target_tokens is not None:
+        needed_tokens = min(target_tokens, max_unique_tokens)
 
     # ── 1. Local binary cache (train.bin / eval.bin) ─────────────────────────
     if data_dir is not None:
@@ -892,7 +919,7 @@ def build_dataloaders(
         eval_path = data_dir / "eval.bin"
         if train_path.exists() and eval_path.exists():
             n = len(np.memmap(train_path, dtype=DTYPE, mode="r"))
-            cache_ok = (target_tokens is None) or (n >= target_tokens)
+            cache_ok = (needed_tokens is None) or (n >= needed_tokens)
             if is_main:
                 if cache_ok:
                     print(
@@ -915,6 +942,7 @@ def build_dataloaders(
                     num_workers,
                     distributed,
                     seed=seed,
+                    max_train_seqs=max_train_seqs,
                 )
         elif is_main:
             print(
@@ -954,7 +982,13 @@ def build_dataloaders(
                 world_size,
                 skip_head_tokens=skip_head,
                 seed=seed,
+                max_train_seqs=max_train_seqs,
             )
+
+    if max_unique_tokens is not None:
+        raise RuntimeError(
+            "max_unique_tokens needs data_dir/train.bin or data_dir/raw/*.tok.bin"
+        )
 
     # ── 1c. Local parquet files — tokenise on-the-fly, no network ────────────
     if data_dir is not None:
