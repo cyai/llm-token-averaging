@@ -37,6 +37,7 @@ Every training job also adds a rescore job and a downstream job for its run.
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import re
 import shlex
@@ -63,6 +64,7 @@ class Job:
     set: str = ""
     marker: bool = False
     cpu: bool = False
+    cleanup: list[str] = field(default_factory=list)
 
 
 class Plan:
@@ -70,6 +72,7 @@ class Plan:
         self.results = results
         self.data_dir = data_dir
         self.out = out
+        self.hub_dir = out / "_hub_ckpts"
         self.jobs: list[Job] = []
 
     def marker(self, name: str) -> Path:
@@ -88,11 +91,12 @@ class Plan:
                "--batch_size", str(batch), "--seq_len", "1024", "--log_steps", "100",
                "--eval_batches", str(eval_batches), "--num_workers", "4",
                "--data_dir", self.data_dir, "--checkpoint_steps", "10000",
-               "--keep_last_checkpoints", "2", "--results_dir", str(self.results / sub),
+               "--keep_last_checkpoints", "1", "--results_dir", str(self.results / sub),
                "--resume"] + (extra or [])
         final = run_dir / "checkpoints" / "final.pt"
         tag = run_dir.name
-        self.add(Job(f"train:{sub}/{tag}", cmd, final, set=set_name))
+        self.add(Job(f"train:{sub}/{tag}", cmd, final, set=set_name,
+                     cleanup=[str(run_dir / "checkpoints" / "step_*.pt")]))
         self.add(Job(
             f"rescore:{sub}/{tag}",
             [PY, f"{RB_DIR}/rescore.py", "--data_dir", self.data_dir,
@@ -107,9 +111,11 @@ class Plan:
         return run_dir
 
     def script(self, set_name: str, name: str, args: list[str], needs: list[Path] | None = None,
-               cpu: bool = False) -> None:
+               cpu: bool = False, cleanup: list[str] | None = None) -> None:
+        if any(a.startswith("hf:") for a in args):
+            args = args + ["--download_dir", str(self.hub_dir)]
         self.add(Job(name, [PY] + args, self.marker(name.replace(":", "_").replace("/", "_")),
-                     needs=needs or [], set=set_name, marker=True, cpu=cpu))
+                     needs=needs or [], set=set_name, marker=True, cpu=cpu, cleanup=cleanup or []))
 
 
 HUB_POOLING = [
@@ -247,7 +253,7 @@ def build_plan(results: Path, data_dir: str, out: Path) -> Plan:
         pl.add(Job(f"kv:finetune_{label}", [
             PY, f"{RB_DIR}/finetune_partial_group.py", "--config", cfg, "--ckpt", ck,
             "--data_dir", data_dir, "--out_dir", str(ft_dir), "--steps", "3000",
-            "--batch_size", str(bs)], ft_final, set="kv"))
+            "--batch_size", str(bs), "--download_dir", str(pl.hub_dir)], ft_final, set="kv"))
         base = "model1_500m" if "500m" in cfg else "model1_50m"
         base_ck = HF + ("model1_500m" if "500m" in cfg else "seed_replicates-model1_50m_seed1")
         pl.script("kv", f"kv:partial_{label}_ft", [
@@ -276,7 +282,9 @@ def build_plan(results: Path, data_dir: str, out: Path) -> Plan:
             pl.script("hub_curves", f"hub_curves:{cfg}_{s}", [
                 f"{RB_DIR}/rescore.py", "--data_dir", data_dir,
                 "--out", str(out / "rescore_hub_curves.jsonl"),
-                "--model", cfg, f"{HF}{cfg}:checkpoints/step_{s:08d}.pt", f"hub-{cfg}-step{s}"])
+                "--model", cfg, f"{HF}{cfg}:checkpoints/step_{s:08d}.pt", f"hub-{cfg}-step{s}"],
+                cleanup=[str(pl.hub_dir / f"FAIRC__token-averaging-{cfg}" / "checkpoints"
+                             / f"step_{s:08d}.pt")])
     return pl
 
 
@@ -320,6 +328,9 @@ def run_queue(jobs: list[Job], gpus: list[str], log_dir: Path, poll: float = 15.
                 if job.marker:
                     job.done.parent.mkdir(parents=True, exist_ok=True)
                     job.done.write_text(time.strftime("%Y-%m-%d %H:%M:%S\n"))
+                for pattern in job.cleanup:
+                    for path in glob.glob(pattern):
+                        os.remove(path)
                 print(f"[queue] done   {job.name}", flush=True)
             else:
                 failed.append(job.name)
