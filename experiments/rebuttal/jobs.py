@@ -195,6 +195,7 @@ def build_plan(results: Path, data_dir: str, out: Path) -> Plan:
     for seed in (1, 2, 3):
         pl.train("update", "update", "avg_50m_k2", seed, run_name="avg_50m_k2_b32", batch=32)
         pl.train("update", "update", "model1_50m", seed, run_name="model1_50m_b8", batch=8)
+        pl.train("update", "update", "avg_50m_k2", seed, run_name="avg_50m_k2_b8", batch=8)
 
     # --- PLT / TST (FLOPs-matched to the 50M k=1 baseline, Eq. 2) -------------
     two_stage = [
