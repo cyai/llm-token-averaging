@@ -215,8 +215,9 @@ def build_plan(results: Path, data_dir: str, out: Path) -> Plan:
     # --- learning-rate sweep --------------------------------------------------
     for lr in ("6e-4", "1.2e-3", "2.4e-3"):
         for cfg in ("model1_50m", "avg_50m_k2"):
-            pl.train("lr", "lr", cfg, 1, run_name=f"{cfg}_lr{lr}", extra=["--lr", lr],
-                     downstream=False)
+            for seed in ((1, 2, 3) if lr == "1.2e-3" else (1,)):
+                pl.train("lr", "lr", cfg, seed, run_name=f"{cfg}_lr{lr}", extra=["--lr", lr],
+                         downstream=lr == "1.2e-3")
 
     # --- data-constrained -----------------------------------------------------
     pl.train("data", "data", "avg_50m_k2", 1, run_name="avg_50m_k2_uniq1b",
