@@ -41,16 +41,29 @@ from experiments.rebuttal.common import eq2_flops_per_raw_token, read_jsonl
 
 CH = Path(__file__).resolve().parent.parent / "chinchilla"
 RB = "results_rebuttal"
+HUB_LOGS = Path(__file__).resolve().parent / "results" / "hf_logs"
+HUB_OWNER = "FAIRC/token-averaging-"
+
+HUB_RUNS: dict[str, str] = {
+    "seed_replicates-model1_50m_seed1": "model1_50m",
+    "seed_replicates-avg_50m_k2_seed1": "avg_50m_k2",
+    "update_control-model1_50m": "model1_50m",
+    "matched_mean-avg_50m_k2": "avg_50m_k2",
+    "matched_mean-avg_50m_k4": "avg_50m_k4",
+    "matched_mean-avg_50m_k8": "avg_50m_k8",
+    "avg_50m_k4_learnable_pos": "avg_50m_k4_learnable_pos",
+    "avg_50m_k8_learnable_pos": "avg_50m_k8_learnable_pos",
+}
 
 GROUPS: dict[str, list[str]] = {
-    "k1": [f"{RB}/seeds/model1_50m_seed*", "results_seed_replicates/model1_50m_seed1"],
-    "k2 mean": [f"{RB}/seeds/avg_50m_k2_seed*", "results_seed_replicates/avg_50m_k2_seed1"],
+    "k1": [f"{RB}/seeds/model1_50m_seed*", "hub:seed_replicates-model1_50m_seed1"],
+    "k2 mean": [f"{RB}/seeds/avg_50m_k2_seed*", "hub:seed_replicates-avg_50m_k2_seed1"],
     "k2 learned c+p": [f"{RB}/seeds/avg_50m_k2_learnable_pos_seed*"],
     "k2 mean, batch 32 (k1 #updates)": [f"{RB}/update/avg_50m_k2_b32_seed*"],
     "k1, batch 8 (k2 #updates)": [f"{RB}/update/model1_50m_b8_seed*"],
     "k2 mean, batch 8": [f"{RB}/update/avg_50m_k2_b8_seed*"],
-    "k1, batch 8 (July run)": ["results_update_control/model1_50m"],
-    "k2 mean (July matched_mean run)": ["results_matched_mean/avg_50m_k2"],
+    "k1, batch 8 (July run)": ["hub:update_control-model1_50m"],
+    "k2 mean (July matched_mean run)": ["hub:matched_mean-avg_50m_k2"],
     "PLT K=4": [f"{RB}/two_stage/plt_50m_k4_l067_seed*"],
     "PLT K=2": [f"{RB}/two_stage/plt_50m_k2_l067_seed*"],
     "TST s=4 r=0.3": [f"{RB}/two_stage/tst_50m_s4_r03_seed*"],
@@ -59,10 +72,10 @@ GROUPS: dict[str, list[str]] = {
     "k1, 1B unique x2 epochs (2x FLOPs)": [f"{RB}/data/model1_50m_2x_uniq1b_seed*"],
     "k4 learned c+p, mean init": [f"{RB}/pooling/avg_50m_k4_learnable_posuni_seed*"],
     "k8 learned c+p, mean init": [f"{RB}/pooling/avg_50m_k8_learnable_posuni_seed*"],
-    "k4 learned c+p, recency init": ["results/avg_50m_k4_learnable_pos"],
-    "k8 learned c+p, recency init": ["results/avg_50m_k8_learnable_pos"],
-    "k4 mean": ["results_matched_mean/avg_50m_k4"],
-    "k8 mean": ["results_matched_mean/avg_50m_k8"],
+    "k4 learned c+p, recency init": ["hub:avg_50m_k4_learnable_pos"],
+    "k8 learned c+p, recency init": ["hub:avg_50m_k8_learnable_pos"],
+    "k4 mean": ["hub:matched_mean-avg_50m_k4"],
+    "k8 mean": ["hub:matched_mean-avg_50m_k8"],
 }
 for _lr in ("6e-4", "1.2e-3", "2.4e-3"):
     GROUPS[f"k1 lr {_lr}"] = [f"{RB}/lr/model1_50m_lr{_lr}_seed*"]
@@ -91,7 +104,19 @@ def _f(x):
         return float("nan")
 
 
-def load_run(run_dir: Path) -> dict | None:
+def fetch_hub_logs(repo: str) -> Path:
+    from huggingface_hub import hf_hub_download, list_repo_files
+
+    d = HUB_LOGS / repo
+    if not (d / "loss_log.csv").exists():
+        files = list_repo_files(HUB_OWNER + repo)
+        for name in ("loss_log.csv", "run_meta.json", "config.json"):
+            if name in files:
+                hf_hub_download(HUB_OWNER + repo, name, local_dir=str(d))
+    return d
+
+
+def load_run(run_dir: Path, cfg_name: str | None = None) -> dict | None:
     log = run_dir / "loss_log.csv"
     if not log.exists():
         return None
@@ -102,7 +127,8 @@ def load_run(run_dir: Path) -> dict | None:
         rows = list(csv.DictReader(f))
     if not rows:
         return None
-    cfg_name = meta.get("base_config") or re.sub(r"_seed\d+$", "", meta.get("run_name") or run_dir.name)
+    cfg_name = cfg_name or meta.get("base_config") or re.sub(
+        r"_seed\d+$", "", meta.get("run_name") or run_dir.name)
     cfg = MODEL_CONFIGS.get(cfg_name)
     budget = meta.get("planned_tokens") or meta.get("target_tokens") or (cfg.target_tokens if cfg else None)
     complete = (
@@ -328,6 +354,12 @@ def main() -> None:
         runs = []
         seen = set()
         for pat in patterns:
+            if pat.startswith("hub:"):
+                repo = pat[len("hub:"):]
+                r = load_run(fetch_hub_logs(repo), HUB_RUNS[repo])
+                if r is not None:
+                    runs.append(r)
+                continue
             for d in sorted(glob.glob(str(root / pat))):
                 d = Path(d)
                 if d in seen or not d.is_dir():
