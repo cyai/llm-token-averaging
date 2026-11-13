@@ -257,7 +257,8 @@ def plot(groups: dict[str, list[dict]], pairs, key: str, out_dir: Path) -> list[
     out_dir.mkdir(parents=True, exist_ok=True)
     files = []
     for base, meth in pairs:
-        rb, rm = groups.get(base, []), groups.get(meth, [])
+        rb = [r for r in groups.get(base, []) if r["usable"].any()]
+        rm = [r for r in groups.get(meth, []) if r["usable"].any()]
         if not rb or not rm:
             continue
         fig, ax = plt.subplots(figsize=(6.4, 4.2))
