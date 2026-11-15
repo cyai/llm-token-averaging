@@ -31,6 +31,7 @@ Sets (priority order of `all`):
   kv          partial-group single-cache quality (+ partial-group fine-tune)
   downstream  downstream evals with the correct pooling, Hub checkpoints
   hub_curves  intermediate 250M/500M Hub checkpoints on the full eval set (large downloads)
+  lr_b8       learning-rate sweep for k=1 and k=2 at batch 8
 Every training job also adds a rescore job and a downstream job for its run.
 """
 
@@ -218,6 +219,11 @@ def build_plan(results: Path, data_dir: str, out: Path) -> Plan:
             for seed in ((1, 2, 3) if lr == "1.2e-3" else (1,)):
                 pl.train("lr", "lr", cfg, seed, run_name=f"{cfg}_lr{lr}", extra=["--lr", lr],
                          downstream=lr == "1.2e-3")
+    for seed in (1, 2):
+        for lr in ("1.2e-3", "6e-4", "2.4e-3"):
+            for cfg in ("model1_50m", "avg_50m_k2"):
+                pl.train("lr_b8", "lr_b8", cfg, seed, run_name=f"{cfg}_b8_lr{lr}", batch=8,
+                         extra=["--lr", lr])
 
     # --- data-constrained -----------------------------------------------------
     pl.train("data", "data", "avg_50m_k2", 1, run_name="avg_50m_k2_uniq1b",
@@ -291,7 +297,7 @@ def build_plan(results: Path, data_dir: str, out: Path) -> Plan:
 
 
 SET_ORDER = ["check", "bench", "rescore_hub", "seeds", "update", "two_stage", "kv",
-             "downstream", "lr", "data", "pooling", "hub_curves"]
+             "downstream", "lr", "data", "pooling", "hub_curves", "lr_b8"]
 
 
 def order_jobs(jobs: list[Job], sets: list[str]) -> list[Job]:

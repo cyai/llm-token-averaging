@@ -80,6 +80,8 @@ GROUPS: dict[str, list[str]] = {
 for _lr in ("6e-4", "1.2e-3", "2.4e-3"):
     GROUPS[f"k1 lr {_lr}"] = [f"{RB}/lr/model1_50m_lr{_lr}_seed*"]
     GROUPS[f"k2 lr {_lr}"] = [f"{RB}/lr/avg_50m_k2_lr{_lr}_seed*"]
+    GROUPS[f"k1 b8 lr {_lr}"] = [f"{RB}/lr_b8/model1_50m_b8_lr{_lr}_seed*"]
+    GROUPS[f"k2 b8 lr {_lr}"] = [f"{RB}/lr_b8/avg_50m_k2_b8_lr{_lr}_seed*"]
 
 PAIRS: list[tuple[str, str]] = [
     ("k1", "k2 mean"),
@@ -92,7 +94,8 @@ PAIRS: list[tuple[str, str]] = [
     ("k1", "TST s=4 r=0.3"),
     ("k1", "TST s=8 r=0.3"),
     ("k1", "k2, 1B unique x2 epochs"),
-] + [(f"k1 lr {lr}", f"k2 lr {lr}") for lr in ("6e-4", "1.2e-3", "2.4e-3")]
+] + [(f"k1 lr {lr}", f"k2 lr {lr}") for lr in ("6e-4", "1.2e-3", "2.4e-3")] + [
+    (f"k1 b8 lr {lr}", f"k2 b8 lr {lr}") for lr in ("6e-4", "1.2e-3", "2.4e-3")]
 
 
 # ---------------------------------------------------------------------------
