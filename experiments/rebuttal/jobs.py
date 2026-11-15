@@ -32,6 +32,7 @@ Sets (priority order of `all`):
   downstream  downstream evals with the correct pooling, Hub checkpoints
   hub_curves  intermediate 250M/500M Hub checkpoints on the full eval set (large downloads)
   lr_b8       learning-rate sweep for k=1 and k=2 at batch 8
+  kv_ft2      partial-group fine-tunes at the end-of-pretraining LR, with standard-loss controls
 Every training job also adds a rescore job and a downstream job for its run.
 """
 
@@ -253,25 +254,32 @@ def build_plan(results: Path, data_dir: str, out: Path) -> Plan:
             f"{RB_DIR}/eval_partial_group.py", "--model", cfg, HF + cfg, label,
             "--baseline", base, HF + base, "--batch_size", "4",
             "--data_dir", data_dir, "--out", str(out / "partial_group.jsonl")])
-    for cfg, ck, label, bs in (("avg_50m_k2", HF + "seed_replicates-avg_50m_k2_seed1", "50m_k2_seed1", 16),
-                               ("avg_50m_k4", HF + "matched_mean-avg_50m_k4", "50m_k4_mean", 16),
-                               ("avg_500m_k2", HF + "avg_500m_k2", "500m_k2", 8)):
-        ft_dir = results / "partial_ft" / f"{label}_ft"
-        ft_final = ft_dir / "checkpoints" / "final.pt"
-        pl.add(Job(f"kv:finetune_{label}", [
-            PY, f"{RB_DIR}/finetune_partial_group.py", "--config", cfg, "--ckpt", ck,
-            "--data_dir", data_dir, "--out_dir", str(ft_dir), "--steps", "3000",
-            "--batch_size", str(bs), "--download_dir", str(pl.hub_dir)], ft_final, set="kv"))
-        base = "model1_500m" if "500m" in cfg else "model1_50m"
-        base_ck = HF + ("model1_500m" if "500m" in cfg else "seed_replicates-model1_50m_seed1")
-        pl.script("kv", f"kv:partial_{label}_ft", [
-            f"{RB_DIR}/eval_partial_group.py", "--model", cfg, str(ft_dir), f"{label}_ft",
-            "--baseline", base, base_ck, "--batch_size", "4" if "500m" in cfg else "8",
-            "--data_dir", data_dir, "--out", str(out / "partial_group.jsonl")], needs=[ft_final])
-        pl.script("kv", f"kv:rescore_{label}_ft", [
-            f"{RB_DIR}/rescore.py", "--data_dir", data_dir,
-            "--out", str(out / "rescore_local.jsonl"), "--runs", f"{ft_dir}={cfg}"],
-            needs=[ft_final])
+    ft_variants = [("kv", "ft", None, ["--lam", "1"]),
+                   ("kv_ft2", "ft_lowlr", "low", ["--lam", "1", "--warmup", "500"]),
+                   ("kv_ft2", "ctrl_lowlr", "low", ["--lam", "0", "--warmup", "500"])]
+    for cfg, ck, label, bs, low_lr in (
+            ("avg_50m_k2", HF + "seed_replicates-avg_50m_k2_seed1", "50m_k2_seed1", 16, "2e-5"),
+            ("avg_50m_k4", HF + "matched_mean-avg_50m_k4", "50m_k4_mean", 16, "2e-5"),
+            ("avg_500m_k2", HF + "avg_500m_k2", "500m_k2", 8, "1.2e-5")):
+        for set_name, suffix, lr, extra in ft_variants:
+            tag = f"{label}_{suffix}"
+            ft_dir = results / "partial_ft" / tag
+            ft_final = ft_dir / "checkpoints" / "final.pt"
+            pl.add(Job(f"kv:finetune_{label}" if suffix == "ft" else f"kv:finetune_{tag}", [
+                PY, f"{RB_DIR}/finetune_partial_group.py", "--config", cfg, "--ckpt", ck,
+                "--data_dir", data_dir, "--out_dir", str(ft_dir), "--steps", "3000",
+                "--batch_size", str(bs), "--download_dir", str(pl.hub_dir)]
+                + (["--lr", low_lr] if lr == "low" else []) + extra, ft_final, set=set_name))
+            base = "model1_500m" if "500m" in cfg else "model1_50m"
+            base_ck = HF + ("model1_500m" if "500m" in cfg else "seed_replicates-model1_50m_seed1")
+            pl.script(set_name, f"kv:partial_{tag}", [
+                f"{RB_DIR}/eval_partial_group.py", "--model", cfg, str(ft_dir), tag,
+                "--baseline", base, base_ck, "--batch_size", "4" if "500m" in cfg else "8",
+                "--data_dir", data_dir, "--out", str(out / "partial_group.jsonl")], needs=[ft_final])
+            pl.script(set_name, f"kv:rescore_{tag}", [
+                f"{RB_DIR}/rescore.py", "--data_dir", data_dir,
+                "--out", str(out / "rescore_local.jsonl"), "--runs", f"{ft_dir}={cfg}"],
+                needs=[ft_final])
 
     # --- downstream on Hub checkpoints (correct pooling) ----------------------
     for cfg, repo in HUB_POOLING + HUB_PAIRS:
@@ -297,7 +305,7 @@ def build_plan(results: Path, data_dir: str, out: Path) -> Plan:
 
 
 SET_ORDER = ["check", "bench", "rescore_hub", "seeds", "update", "two_stage", "kv",
-             "downstream", "lr", "data", "pooling", "hub_curves", "lr_b8"]
+             "downstream", "lr", "data", "pooling", "hub_curves", "lr_b8", "kv_ft2"]
 
 
 def order_jobs(jobs: list[Job], sets: list[str]) -> list[Job]:

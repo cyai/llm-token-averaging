@@ -111,8 +111,12 @@ def main() -> None:
         r = random.randint(1, m.k - 1)
         with autocast(args.device):
             loss_std, _ = lm(ids)
-            loss_p = partial_loss(m, ids, r, args.mode, layers)
-            loss = loss_std + args.lam * loss_p
+            if args.lam > 0:
+                loss_p = partial_loss(m, ids, r, args.mode, layers)
+                loss = loss_std + args.lam * loss_p
+            else:
+                loss_p = torch.full_like(loss_std, float("nan"))
+                loss = loss_std
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(lm.parameters(), 1.0)
@@ -135,7 +139,8 @@ def main() -> None:
         "run_name": out_dir.name,
         "base_config": args.config,
         "finetune_of": str(args.ckpt),
-        "finetune": {"objective": "standard + partial-group", "steps": args.steps,
+        "finetune": {"objective": "standard + partial-group" if args.lam > 0 else "standard",
+                     "steps": args.steps, "warmup": args.warmup,
                      "batch_size": args.batch_size, "lr": args.lr, "lam": args.lam,
                      "mode": args.mode, "tokens": tokens,
                      "approx_flops_eq2": tokens * eq2_flops_per_raw_token(m.cfg, seq_len, m.k) * 3},
