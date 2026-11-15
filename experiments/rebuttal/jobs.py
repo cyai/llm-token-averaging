@@ -259,7 +259,12 @@ def build_plan(results: Path, data_dir: str, out: Path) -> Plan:
             [(c, ck, lb, "model1_50m", HF + "seed_replicates-model1_50m_seed1", "8")
              for c, ck, lb in kv_models]
             + [("avg_250m_k2", HF + "avg_250m_k2", "250m_k2", "model1_250m", HF + "model1_250m", "4"),
-               ("avg_500m_k2", HF + "avg_500m_k2", "500m_k2", "model1_500m", HF + "model1_500m", "4")]):
+               ("avg_500m_k2", HF + "avg_500m_k2", "500m_k2", "model1_500m", HF + "model1_500m", "4")]
+            + [("avg_50m_k2_learnable_pos",
+                str(results / "seeds" / f"avg_50m_k2_learnable_pos_seed{s}"), f"50m_k2_lpos_seed{s}",
+                "model1_50m", HF + "seed_replicates-model1_50m_seed1", "8") for s in (1, 2, 3)]
+            + [(f"avg_50m_k{k}_learnable_pos", HF + f"avg_50m_k{k}_learnable_pos", f"50m_k{k}_lpos",
+                "model1_50m", HF + "seed_replicates-model1_50m_seed1", "8") for k in (4, 8)]):
         pl.script("kv_window", f"kv:window_{label}", [
             f"{RB_DIR}/eval_partial_group.py", "--model", cfg, ck, f"{label}_window",
             "--baseline", base, base_ck, "--modes", "renorm,window", "--batch_size", bs,
