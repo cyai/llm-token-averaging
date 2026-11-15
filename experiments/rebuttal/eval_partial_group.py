@@ -13,6 +13,11 @@ The model never saw partial groups in training, so this is out of
 distribution; this script measures how much worse it is than the offset
 ensemble (k caches) on the same target positions.
 
+Mode `window` fills the slot with the last k raw tokens instead (the r new
+tokens plus the last k - r tokens of the previous group), i.e. a complete
+group of the offset-r grid. For k=2 the slot for predicting t10 is (t8, t9).
+The slot at j = 0 has no previous group and uses `renorm`; it is never scored.
+
 All partial predictions for a fixed r are computed in one parallel pass over
 the concatenation [G_0..G_{N-1}, P_0^r..P_{J-1}^r] with a mask in which G
 is causal over G and P_j sees G_{<j} and itself. This is exactly what
@@ -72,7 +77,12 @@ def single_cache_nll(m: LoadedModel, ids: torch.Tensor, mode: str, layers) -> to
         for r in range(1, k):
             J = min((T - 1 - r) // k + 1, N)
             windows = emb[:, : J * k].reshape(B, J, k, -1)[:, :, :r]
-            P = pool_partial(m, windows, r, mode=mode, ref_norm=ref_norm).to(G.dtype)
+            if mode == "window":
+                P0 = pool_partial(m, windows[:, :1], r, mode="renorm", ref_norm=ref_norm)
+                span = slice(r, r + (J - 1) * k)
+                P = torch.cat([P0, m.pool(emb[:, span], ids[:, span])], dim=1).to(G.dtype)
+            else:
+                P = pool_partial(m, windows, r, mode=mode, ref_norm=ref_norm).to(G.dtype)
             X = torch.cat([G, P], dim=1)
             positions = torch.cat([torch.arange(N, device=ids.device),
                                    torch.arange(J, device=ids.device)])
@@ -112,7 +122,7 @@ def main() -> None:
                    help="Optional k=1 model scored on the same positions.")
     p.add_argument("--data_dir", required=True)
     p.add_argument("--out", required=True, help="JSONL output")
-    p.add_argument("--modes", default="renorm,repeat_last,norm_matched")
+    p.add_argument("--modes", default="renorm,repeat_last,norm_matched,window")
     p.add_argument("--max_seqs", type=int, default=512)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--device", default=default_device())

@@ -71,7 +71,7 @@ def downstream(res: Path) -> list[str]:
 
 
 def partial(res: Path) -> list[str]:
-    rows = read_jsonl(res / "partial_group.jsonl")
+    rows = read_jsonl(res / "partial_group.jsonl") + read_jsonl(res / "partial_group_window.jsonl")
     if not rows:
         return []
     out = ["## Single-cache decoding with a tentative partial group", "",

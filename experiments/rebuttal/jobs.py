@@ -33,6 +33,7 @@ Sets (priority order of `all`):
   hub_curves  intermediate 250M/500M Hub checkpoints on the full eval set (large downloads)
   lr_b8       learning-rate sweep for k=1 and k=2 at batch 8
   kv_ft2      partial-group fine-tunes at the end-of-pretraining LR, with standard-loss controls
+  kv_window   single cache whose open slot holds the last k raw tokens (no fine-tuning)
 Every training job also adds a rescore job and a downstream job for its run.
 """
 
@@ -254,6 +255,15 @@ def build_plan(results: Path, data_dir: str, out: Path) -> Plan:
             f"{RB_DIR}/eval_partial_group.py", "--model", cfg, HF + cfg, label,
             "--baseline", base, HF + base, "--batch_size", "4",
             "--data_dir", data_dir, "--out", str(out / "partial_group.jsonl")])
+    for cfg, ck, label, base, base_ck, bs in (
+            [(c, ck, lb, "model1_50m", HF + "seed_replicates-model1_50m_seed1", "8")
+             for c, ck, lb in kv_models]
+            + [("avg_250m_k2", HF + "avg_250m_k2", "250m_k2", "model1_250m", HF + "model1_250m", "4"),
+               ("avg_500m_k2", HF + "avg_500m_k2", "500m_k2", "model1_500m", HF + "model1_500m", "4")]):
+        pl.script("kv_window", f"kv:window_{label}", [
+            f"{RB_DIR}/eval_partial_group.py", "--model", cfg, ck, f"{label}_window",
+            "--baseline", base, base_ck, "--modes", "renorm,window", "--batch_size", bs,
+            "--data_dir", data_dir, "--out", str(out / "partial_group_window.jsonl")])
     ft_variants = [("kv", "ft", None, ["--lam", "1"]),
                    ("kv_ft2", "ft_lowlr", "low", ["--lam", "1", "--warmup", "500"]),
                    ("kv_ft2", "ctrl_lowlr", "low", ["--lam", "0", "--warmup", "500"])]
@@ -305,7 +315,7 @@ def build_plan(results: Path, data_dir: str, out: Path) -> Plan:
 
 
 SET_ORDER = ["check", "bench", "rescore_hub", "seeds", "update", "two_stage", "kv",
-             "downstream", "lr", "data", "pooling", "hub_curves", "lr_b8", "kv_ft2"]
+             "downstream", "lr", "data", "pooling", "hub_curves", "lr_b8", "kv_ft2", "kv_window"]
 
 
 def order_jobs(jobs: list[Job], sets: list[str]) -> list[Job]:
