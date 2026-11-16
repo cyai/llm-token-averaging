@@ -215,6 +215,17 @@ def build_plan(results: Path, data_dir: str, out: Path) -> Plan:
         for run_name, extra in two_stage:
             pl.train("two_stage", "two_stage", "model1_50m", seed, run_name=run_name, extra=extra)
 
+    # --- PLT as in Shao et al.: K*T raw context in stage 1, same raw tokens per
+    # step, optimizer and schedule reset at the switch; steps solve
+    # N * (lambda/K + 1 - lambda) = 61036 so Eq. 2 FLOPs match k=1 ------------
+    for k, steps in ((2, 91554), (4, 122072)):
+        for seed in (1, 2):
+            pl.train("plt_ctx", "two_stage", "model1_50m", seed, run_name=f"plt_50m_k{k}_ctx",
+                     extra=["--two_stage_k", str(k), "--two_stage_frac", "0.6667",
+                            "--two_stage_seq_mult", str(k), "--two_stage_batch_size", str(16 // k),
+                            "--two_stage_reset_optim", "--total_steps", str(steps),
+                            "--target_tokens", str(steps * 16384)])
+
     # --- learning-rate sweep --------------------------------------------------
     for lr in ("6e-4", "1.2e-3", "2.4e-3"):
         for cfg in ("model1_50m", "avg_50m_k2"):
@@ -326,7 +337,7 @@ def build_plan(results: Path, data_dir: str, out: Path) -> Plan:
 
 
 SET_ORDER = ["check", "bench", "rescore_hub", "seeds", "update", "two_stage", "kv",
-             "downstream", "lr", "data", "pooling", "hub_curves", "lr_b8", "kv_ft2", "kv_window"]
+             "downstream", "lr", "data", "pooling", "hub_curves", "lr_b8", "kv_ft2", "kv_window", "plt_ctx"]
 
 
 def order_jobs(jobs: list[Job], sets: list[str]) -> list[Job]:

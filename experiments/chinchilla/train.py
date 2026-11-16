@@ -663,15 +663,16 @@ def train_model(
     seqs_per_micro_step  = args.batch_size * world_size
     seqs_per_global_step = seqs_per_micro_step * accum_steps
 
-    def _stage_costs(raw_len: int, positions: int) -> tuple[int, float, float]:
+    def _stage_costs(raw_len: int, positions: int,
+                     seqs: int = seqs_per_global_step) -> tuple[int, float, float]:
         body, eq2 = train_flops_per_seq(cfg, positions)
-        return (seqs_per_global_step * raw_len,
-                seqs_per_global_step * body,
-                seqs_per_global_step * eq2)
+        return (seqs * raw_len, seqs * body, seqs * eq2)
 
+    stage1_batch = args.two_stage_batch_size or args.batch_size
     if is_two_stage:
         stage1_raw_len = args.seq_len * seq_mult
-        stage1_costs = _stage_costs(stage1_raw_len, stage1_raw_len // two_stage_k)
+        stage1_costs = _stage_costs(stage1_raw_len, stage1_raw_len // two_stage_k,
+                                    stage1_batch * world_size * accum_steps)
         stage2_costs = _stage_costs(args.seq_len, args.seq_len)
         stage_switch_step = int(total_steps * args.two_stage_frac)
     else:
@@ -684,11 +685,11 @@ def train_model(
                          + (total_steps - stage_switch_step) * stage2_costs[2])
 
     stage1_dl = None
-    if is_two_stage and seq_mult > 1:
+    if is_two_stage and (seq_mult > 1 or stage1_batch != args.batch_size):
         stage1_dl, _ = build_dataloaders(
             tokenizer=tokenizer,
             seq_len=args.seq_len * seq_mult,
-            batch_size=args.batch_size,
+            batch_size=stage1_batch,
             eval_batches=1,
             num_workers=args.num_workers,
             rank=global_rank,
@@ -700,13 +701,23 @@ def train_model(
             max_unique_tokens=args.max_unique_tokens,
         )
 
-    optimizer = _build_optimizer(model, lr=cfg.lr)
-    scheduler = get_cosine_schedule_with_warmup_and_min_lr(
-        optimizer,
-        num_warmup_steps=cfg.warmup_steps,
-        num_training_steps=total_steps,
-        min_lr_ratio=MIN_LR_RATIO,
-    )
+    reset_at_switch = is_two_stage and args.two_stage_reset_optim
+
+    def _make_optim(stage2: bool):
+        if reset_at_switch:
+            steps = total_steps - stage_switch_step if stage2 else stage_switch_step
+        else:
+            steps = total_steps
+        opt = _build_optimizer(model, lr=cfg.lr)
+        sched = get_cosine_schedule_with_warmup_and_min_lr(
+            opt,
+            num_warmup_steps=cfg.warmup_steps,
+            num_training_steps=steps,
+            min_lr_ratio=MIN_LR_RATIO,
+        )
+        return opt, sched
+
+    optimizer, scheduler = _make_optim(stage2=False)
 
     # --- resume -------------------------------------------------------------
     start_step       = 0
@@ -720,6 +731,8 @@ def train_model(
             if is_main:
                 print(f"[{cfg.name}] Resuming from {latest} …", flush=True)
             model.load_state_dict(state["model"])
+            if reset_at_switch and state["step"] >= stage_switch_step:
+                optimizer, scheduler = _make_optim(stage2=True)
             optimizer.load_state_dict(state["optimizer"])
             scheduler.load_state_dict(state["scheduler"])
             start_step       = state["step"]
@@ -771,6 +784,8 @@ def train_model(
             "two_stage_k": two_stage_k if is_two_stage else None,
             "two_stage_frac": args.two_stage_frac if is_two_stage else None,
             "two_stage_seq_mult": seq_mult if is_two_stage else None,
+            "two_stage_batch_size": stage1_batch if is_two_stage else None,
+            "two_stage_reset_optim": reset_at_switch,
             "stage_switch_step": stage_switch_step if is_two_stage else None,
             "compiled": not args.no_compile,
             "torch_version": torch.__version__,
@@ -943,6 +958,8 @@ def train_model(
             raw_model.set_token_level(True)
             stage_switched = True
             tokens_per_global_step, flops_per_global_step, eq2_per_global_step = stage2_costs
+            if reset_at_switch:
+                optimizer, scheduler = _make_optim(stage2=True)
             if active_dl is not train_dl:
                 active_dl = train_dl
                 train_iter = iter(active_dl)
@@ -1163,6 +1180,12 @@ def parse_args() -> argparse.Namespace:
                         "length as stage 2 (patch-level training); k = k× longer "
                         "raw sequences so stage-1 steps cost about the same "
                         "FLOPs as token-level steps (token superposition).")
+    p.add_argument("--two_stage_batch_size", type=int, default=None,
+                   help="Per-rank sequences per micro-step in stage 1 "
+                        "(default: --batch_size).")
+    p.add_argument("--two_stage_reset_optim", action="store_true",
+                   help="Fresh optimizer and warmup+cosine schedule for each "
+                        "stage, as in Shao et al. (2025).")
     p.add_argument("--no_compile",       action="store_true")
     return p.parse_args()
 
